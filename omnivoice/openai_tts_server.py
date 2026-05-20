@@ -55,6 +55,9 @@ DEFAULT_AUDIO_CHUNK_THRESHOLD = float(
 DEFAULT_SENTENCE_CHUNKING_MIN_CHARS = int(
     os.getenv("OMNIVOICE_SENTENCE_CHUNKING_MIN_CHARS", "280")
 )
+PREWARM_LOCAL_VOICE_PROMPTS = (
+    os.getenv("OMNIVOICE_PREWARM_LOCAL_VOICE_PROMPTS", "1") != "0"
+)
 CHUNKED_PIPELINE_ENABLED = os.getenv("OMNIVOICE_CHUNKED_PIPELINE", "1") != "0"
 CHUNK_MAX_WORKERS = max(1, min(2, int(os.getenv("OMNIVOICE_CHUNK_MAX_WORKERS", "2"))))
 CHUNK_MAX_QUEUE_DEPTH = max(1, int(os.getenv("OMNIVOICE_CHUNK_MAX_QUEUE_DEPTH", "64")))
@@ -1084,6 +1087,7 @@ class OmniVoiceService:
         self._voice_prompt_cache: _VoicePromptLRUCache = _VoicePromptLRUCache(
             maxsize=128
         )
+        self._voice_prewarm_task: asyncio.Task | None = None
 
     def set_lock(self, lock: asyncio.Lock) -> None:
         self.load_lock = lock
@@ -1206,6 +1210,11 @@ class OmniVoiceService:
             "load_error": self.load_error,
             "default_voice": DEFAULT_VOICE,
             "idle_timeout": self._idle_timeout,
+            "voice_prompt_cache_size": len(self._voice_prompt_cache),
+            "voice_prompt_prewarm_enabled": PREWARM_LOCAL_VOICE_PROMPTS,
+            "voice_prompt_prewarm_running": (
+                self._voice_prewarm_task is not None and not self._voice_prewarm_task.done()
+            ),
         }
 
     def get_or_create_voice_clone_prompt(
@@ -1226,6 +1235,46 @@ class OmniVoiceService:
         )
         self._voice_prompt_cache[cache_key] = prompt
         return prompt
+
+    def _prewarm_local_voice_prompts_sync(self, model: OmniVoice) -> int:
+        warmed = 0
+        for cache_key, ref_audio_path, ref_text in _iter_unique_local_voice_prompt_specs():
+            if self._voice_prompt_cache.get(cache_key) is not None:
+                continue
+            self.get_or_create_voice_clone_prompt(
+                model,
+                cache_key=cache_key,
+                ref_audio_path=ref_audio_path,
+                ref_text=ref_text,
+            )
+            warmed += 1
+        return warmed
+
+    async def prewarm_local_voice_prompts(self) -> int:
+        model = await self.get_model()
+        if self.generation_lock is not None:
+            async with self.generation_lock:
+                return await asyncio.to_thread(
+                    self._prewarm_local_voice_prompts_sync, model
+                )
+        return await asyncio.to_thread(self._prewarm_local_voice_prompts_sync, model)
+
+    def schedule_voice_prompt_prewarm(self) -> None:
+        if not PREWARM_LOCAL_VOICE_PROMPTS or WORKER_MODE:
+            return
+        if self._voice_prewarm_task is not None and not self._voice_prewarm_task.done():
+            return
+
+        async def _run() -> None:
+            try:
+                warmed = await self.prewarm_local_voice_prompts()
+                LOG.info("Local voice prompt prewarm completed (%d prompt(s) warmed)", warmed)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Failed to prewarm local voice prompts")
+
+        self._voice_prewarm_task = asyncio.get_event_loop().create_task(_run())
 
 
 class ASRService:
@@ -2214,6 +2263,22 @@ def _supported_voices() -> list[dict[str, str]]:
     return [{"id": item.id, "name": item.display_name()} for item in VOICE_OPTIONS]
 
 
+def _iter_unique_local_voice_prompt_specs() -> list[tuple[str, Path, Optional[str]]]:
+    seen: set[tuple[str, Optional[str]]] = set()
+    specs: list[tuple[str, Path, Optional[str]]] = []
+    for option in VOICE_OPTIONS:
+        sample_path = option.sample_path
+        if sample_path is None or not sample_path.is_file():
+            continue
+        cache_key = f"{sample_path.resolve()}::{option.sample_ref_text!r}"
+        dedupe_key = (str(sample_path.resolve()), option.sample_ref_text)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        specs.append((cache_key, sample_path, option.sample_ref_text))
+    return specs
+
+
 def _truncate_preview(text: Optional[str], limit: int = DEBUG_PREVIEW_CHARS) -> str:
     if not text:
         return ""
@@ -3177,6 +3242,7 @@ async def lifespan(_: FastAPI):
     service.set_generation_lock(asyncio.Semaphore(1))
     asr_service.set_lock(asyncio.Lock())
     secondary_worker_manager.set_lock(asyncio.Lock())
+    service.schedule_voice_prompt_prewarm()
     LOG.info(
         "Starting OmniVoice TTS server (api_model=%s, backend_model=%s, device=%s, idle_timeout=%.0fs, asr_model=%s, asr_device=%s, asr_idle_timeout=%.0fs, worker_mode=%s, chunked_pipeline=%s, chunk_max_workers=%s)",
         API_MODEL_ID,
@@ -3191,6 +3257,8 @@ async def lifespan(_: FastAPI):
         CHUNK_MAX_WORKERS,
     )
     yield
+    if service._voice_prewarm_task is not None:
+        service._voice_prewarm_task.cancel()
     await secondary_worker_manager.shutdown()
     if service._idle_task is not None:
         service._idle_task.cancel()

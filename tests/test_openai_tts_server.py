@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import torch
@@ -18,6 +19,7 @@ from omnivoice.openai_tts_server import (
     _detect_sentences,
     _has_secondary_worker_gpu_headroom,
     _iter_ordered_chunk_results,
+    _iter_unique_local_voice_prompt_specs,
     _plan_sentence_chunks_with_source,
     _prepare_request,
     _process_chunk_with_retry,
@@ -96,6 +98,29 @@ class OpenAITTSServerTests(unittest.TestCase):
         self.assertIn("gpt-4o-mini-tts", model_ids)
         self.assertIn("alloy", voice_ids)
         self.assertIn("british_man", voice_ids)
+
+    def test_unique_local_voice_prompt_specs_are_deduplicated(self) -> None:
+        specs = _iter_unique_local_voice_prompt_specs()
+        self.assertTrue(specs)
+        self.assertEqual(len(specs), len({cache_key for cache_key, _, _ in specs}))
+
+    def test_prewarm_local_voice_prompts_populates_cache_once(self) -> None:
+        fake_model = _FakeModel()
+        specs = [
+            ("voice-a", Path("/tmp/voice-a.wav"), "alpha"),
+            ("voice-b", Path("/tmp/voice-b.wav"), "beta"),
+        ]
+
+        with patch(
+            "omnivoice.openai_tts_server._iter_unique_local_voice_prompt_specs",
+            return_value=specs,
+        ):
+            warmed_first = service._prewarm_local_voice_prompts_sync(fake_model)
+            warmed_second = service._prewarm_local_voice_prompts_sync(fake_model)
+
+        self.assertEqual(warmed_first, 2)
+        self.assertEqual(warmed_second, 0)
+        self.assertEqual(len(fake_model.voice_prompt_calls), 2)
 
     def test_resolve_voice_prefers_local_reference_when_available(self) -> None:
         resolved = _resolve_voice("alloy")
