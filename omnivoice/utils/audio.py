@@ -223,6 +223,7 @@ def trim_trailing_artifact(
         trim_at = None
         in_burst = False
         burst_start = None
+        burst_end = None
         burst_len = 0
         silence_len = 0
 
@@ -234,10 +235,12 @@ def trim_trailing_artifact(
                 if loud[chunk_idx].item():
                     in_burst = True
                     burst_start = pos
+                    burst_end = end
                     burst_len = chunk_len
                     silence_len = 0
             else:
                 if loud[chunk_idx].item():
+                    burst_start = pos
                     burst_len += chunk_len
                     if burst_len > max_artifact_samples:
                         break
@@ -251,11 +254,12 @@ def trim_trailing_artifact(
             break
 
         trim_samples = trim_at
+        burst_end = burst_end if burst_end is not None else total_samples
         energy_context_samples = min(
             trim_samples, int(sampling_rate * _ARTIFACT_ENERGY_CONTEXT_SECONDS)
         )
         main_audio = audio[:, trim_samples - energy_context_samples : trim_samples]
-        artifact_audio = audio[:, trim_samples:]
+        artifact_audio = audio[:, trim_samples:burst_end]
         if main_audio.numel() > 0 and artifact_audio.numel() > 0:
             main_rms = _rms(main_audio).item()
             art_rms = _rms(artifact_audio).item()

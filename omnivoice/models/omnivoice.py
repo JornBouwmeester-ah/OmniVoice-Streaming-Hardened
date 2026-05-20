@@ -125,6 +125,7 @@ class GenerationTask:
     ref_audio_tokens: List[Optional[torch.Tensor]]
     ref_rms: List[Optional[float]]
     speed: Optional[List[float]] = None
+    prefix_caches: Optional[List[Optional["_InferencePrefixCache"]]] = None
 
     def get_indices(self, config: OmniVoiceGenerationConfig, frame_rate: int):
         threshold = int(config.audio_chunk_threshold * frame_rate)
@@ -145,15 +146,29 @@ class GenerationTask:
             ref_audio_tokens=[self.ref_audio_tokens[i] for i in indices],
             ref_rms=[self.ref_rms[i] for i in indices],
             speed=[self.speed[i] for i in indices] if self.speed else None,
+            prefix_caches=(
+                [self.prefix_caches[i] for i in indices] if self.prefix_caches else None
+            ),
         )
+
+
+@dataclass
+class _InferencePrefixCache:
+    """Precomputed fixed token tensors for a single inference item.
+
+    Used by ``_generate_chunked`` to avoid repeating style tokenization
+    and GPU memory transfers across every text chunk of the same request.
+    Both tensors are already placed on the model device.
+    """
+
+    style_tokens: torch.Tensor  # [1, C, N_style], on model device
+    ref_audio_device: Optional[torch.Tensor]  # [1, C, T_ref], on model device; None if no ref
 
 
 @dataclass
 class OmniVoiceModelOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
-
-
 # ---------------------------------------------------------------------------
 # Config & Model
 # ---------------------------------------------------------------------------
@@ -856,7 +871,7 @@ class OmniVoice(PreTrainedModel):
         # chunk_results[item_idx] = list of generated token tensors per chunk
         chunk_results = [[] for _ in range(task.batch_size)]
 
-        def _run_batch(indices, texts, ref_audios, ref_texts):
+        def _run_batch(indices, texts, ref_audios, ref_texts, prefix_caches=None):
             speed_list = task.speed
             target_lens = [
                 self._estimate_target_tokens(
@@ -877,6 +892,7 @@ class OmniVoice(PreTrainedModel):
                 ref_audio_tokens=ref_audios,
                 ref_rms=[task.ref_rms[i] for i in indices],
                 speed=[task.speed[i] for i in indices] if task.speed else None,
+                prefix_caches=prefix_caches,
             )
             gen_tokens = self._generate_iterative(sub_task, gen_config)
             for j, idx in enumerate(indices):
@@ -887,6 +903,18 @@ class OmniVoice(PreTrainedModel):
             # We still sequentially generate chunks within each item, but we
             # batch across items for the same chunk index. This allows to keep
             # the VRAM usage manageable while still benefiting from batching.
+            #
+            # Precompute style tokens and device-place ref audio once per item;
+            # reused across all chunks to skip redundant tokenization/transfers.
+            item_prefix_caches = [
+                self._make_prefix_cache(
+                    lang=task.langs[i],
+                    instruct=task.instructs[i],
+                    ref_audio_tokens=task.ref_audio_tokens[i],
+                    denoise=gen_config.denoise,
+                )
+                for i in range(task.batch_size)
+            ]
             for ci in range(max_num_chunks):
                 indices = [i for i in range(task.batch_size) if ci < len(all_chunks[i])]
                 if not indices:
@@ -896,6 +924,7 @@ class OmniVoice(PreTrainedModel):
                     texts=[all_chunks[i][ci] for i in indices],
                     ref_audios=[task.ref_audio_tokens[i] for i in indices],
                     ref_texts=[task.ref_texts[i] for i in indices],
+                    prefix_caches=[item_prefix_caches[i] for i in indices],
                 )
         else:
             # No reference audio — generate chunk 0 for all items first,
@@ -906,8 +935,21 @@ class OmniVoice(PreTrainedModel):
                 texts=[all_chunks[i][0] for i in indices_0],
                 ref_audios=[None] * len(indices_0),
                 ref_texts=[None] * len(indices_0),
+                prefix_caches=None,  # chunk 0: no ref audio, no style cache benefit
             )
             first_chunk_map = {idx: chunk_results[idx][0] for idx in indices_0}
+
+            # Precompute prefix caches for chunks 1+: style now includes <|denoise|>
+            # since the first-chunk output is used as reference audio.
+            ref_cache_map = {
+                idx: self._make_prefix_cache(
+                    lang=task.langs[idx],
+                    instruct=task.instructs[idx],
+                    ref_audio_tokens=first_chunk_map[idx],
+                    denoise=gen_config.denoise,
+                )
+                for idx in indices_0
+            }
 
             # Batch all remaining chunks, using chunk 0 as fixed reference
             for ci in range(1, max_num_chunks):
@@ -919,6 +961,7 @@ class OmniVoice(PreTrainedModel):
                     texts=[all_chunks[i][ci] for i in indices],
                     ref_audios=[first_chunk_map[i] for i in indices],
                     ref_texts=[all_chunks[i][0] for i in indices],
+                    prefix_caches=[ref_cache_map[i] for i in indices],
                 )
 
         return chunk_results
@@ -1089,6 +1132,42 @@ class OmniVoice(PreTrainedModel):
             x_list = x_list * batch_size
         return x_list
 
+    def _make_prefix_cache(
+        self,
+        lang: Optional[str],
+        instruct: Optional[str],
+        ref_audio_tokens: Optional[torch.Tensor],
+        denoise: bool,
+    ) -> "_InferencePrefixCache":
+        """Precompute fixed style tokens and device-place ref audio for one item.
+
+        Calling this once per request and passing the result to
+        ``_prepare_inference_inputs`` via ``prefix_cache`` eliminates
+        the repeated tokenizer call and H2D transfer that would otherwise
+        happen for every text chunk.
+        """
+        style_text = ""
+        if denoise and ref_audio_tokens is not None:
+            style_text += "<|denoise|>"
+        lang_str = lang if lang else "None"
+        instruct_str = instruct if instruct else "None"
+        style_text += f"<|lang_start|>{lang_str}<|lang_end|>"
+        style_text += f"<|instruct_start|>{instruct_str}<|instruct_end|>"
+        style_tokens = (
+            self.text_tokenizer(style_text, return_tensors="pt")
+            .input_ids.repeat(self.config.num_audio_codebook, 1)
+            .unsqueeze(0)
+        ).to(self.device)  # [1, C, N_style]
+        ref_audio_device = (
+            ref_audio_tokens.unsqueeze(0).to(self.device)
+            if ref_audio_tokens is not None
+            else None
+        )
+        return _InferencePrefixCache(
+            style_tokens=style_tokens,
+            ref_audio_device=ref_audio_device,
+        )
+
     def _prepare_inference_inputs(
         self,
         text: str,
@@ -1098,6 +1177,7 @@ class OmniVoice(PreTrainedModel):
         lang: Optional[str] = None,
         instruct: Optional[str] = None,
         denoise: bool = True,
+        prefix_cache: Optional["_InferencePrefixCache"] = None,
     ):
         """Prepare input_ids and audio masks for inference.
         Args:
@@ -1109,25 +1189,36 @@ class OmniVoice(PreTrainedModel):
             lang: Optional language ID.
             instruct: Optional style instruction for voice design.
             denoise: Whether to include the <|denoise|> token.
+            prefix_cache: Optional precomputed style tokens and device-placed
+                ref audio. When provided, skips redundant tokenization and H2D
+                transfers for the fixed prefix shared across all chunks.
         """
 
-        # Build style tokens: <|denoise|> + <|lang_start|>...<|lang_end|>
-        #                      + <|instruct_start|>...<|instruct_end|>
-        style_text = ""
-        if denoise and ref_audio_tokens is not None:
-            style_text += "<|denoise|>"
-        lang_str = lang if lang else "None"
-        instruct_str = instruct if instruct else "None"
-        style_text += f"<|lang_start|>{lang_str}<|lang_end|>"
-        style_text += f"<|instruct_start|>{instruct_str}<|instruct_end|>"
+        if prefix_cache is not None:
+            style_tokens = prefix_cache.style_tokens  # [1, C, N_style], already on device
+            ref_on_device = prefix_cache.ref_audio_device  # already on device or None
+        else:
+            # Build style tokens: <|denoise|> + <|lang_start|>...<|lang_end|>
+            #                      + <|instruct_start|>...<|instruct_end|>
+            style_text = ""
+            if denoise and ref_audio_tokens is not None:
+                style_text += "<|denoise|>"
+            lang_str = lang if lang else "None"
+            instruct_str = instruct if instruct else "None"
+            style_text += f"<|lang_start|>{lang_str}<|lang_end|>"
+            style_text += f"<|instruct_start|>{instruct_str}<|instruct_end|>"
+            style_tokens = (
+                self.text_tokenizer(style_text, return_tensors="pt")
+                .input_ids.repeat(self.config.num_audio_codebook, 1)
+                .unsqueeze(0)
+            ).to(self.device)  # [1, C, N_style]
+            ref_on_device = (
+                ref_audio_tokens.unsqueeze(0).to(self.device)
+                if ref_audio_tokens is not None
+                else None
+            )
 
-        style_tokens = (
-            self.text_tokenizer(style_text, return_tensors="pt")
-            .input_ids.repeat(self.config.num_audio_codebook, 1)
-            .unsqueeze(0)
-        ).to(self.device)  # [1, C, N1]
-
-        # Build text tokens
+        # Build text tokens (chunk-specific; always recomputed)
         full_text = _combine_text(ref_text=ref_text, text=text)
         wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
         text_tokens = (
@@ -1146,15 +1237,15 @@ class OmniVoice(PreTrainedModel):
 
         # Conditional input
         parts = [style_tokens, text_tokens]
-        if ref_audio_tokens is not None:
-            parts.append(ref_audio_tokens.unsqueeze(0).to(self.device))
+        if ref_on_device is not None:
+            parts.append(ref_on_device)
         parts.append(target_audio_tokens)
         cond_input_ids = torch.cat(parts, dim=2)
 
         cond_total_length = cond_input_ids.shape[2]
         cond_audio_start_idx = cond_total_length - num_target_tokens
-        if ref_audio_tokens is not None:
-            cond_audio_start_idx -= ref_audio_tokens.size(-1)
+        if ref_on_device is not None:
+            cond_audio_start_idx -= ref_on_device.size(-1)
 
         cond_audio_mask = torch.zeros(
             1, cond_total_length, dtype=torch.bool, device=self.device
@@ -1203,6 +1294,7 @@ class OmniVoice(PreTrainedModel):
                 task.langs[i],
                 task.instructs[i],
                 gen_config.denoise,
+                prefix_cache=task.prefix_caches[i] if task.prefix_caches else None,
             )
             for i in range(B)
         ]

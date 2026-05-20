@@ -4,7 +4,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import OrderedDict
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from html import escape
+import json
 import logging
 import math
 import os
@@ -14,10 +17,10 @@ import io
 import tempfile
 import time
 import unicodedata
+import urllib.request
 import wave
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Literal, Optional
 from uuid import uuid4
 
@@ -32,8 +35,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydub import AudioSegment
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.utils.audio import cross_fade_chunks
 from omnivoice.utils.common import get_best_device, resolve_inference_dtype
-from omnivoice.utils.text import add_punctuation, chunk_text_punctuation
+from omnivoice.utils.text import ABBREVIATIONS, CLOSING_MARKS, add_punctuation
 
 
 LOG = logging.getLogger("omnivoice.openai_tts_server")
@@ -51,6 +55,32 @@ DEFAULT_AUDIO_CHUNK_THRESHOLD = float(
 DEFAULT_SENTENCE_CHUNKING_MIN_CHARS = int(
     os.getenv("OMNIVOICE_SENTENCE_CHUNKING_MIN_CHARS", "280")
 )
+CHUNKED_PIPELINE_ENABLED = os.getenv("OMNIVOICE_CHUNKED_PIPELINE", "1") != "0"
+CHUNK_MAX_WORKERS = max(1, min(2, int(os.getenv("OMNIVOICE_CHUNK_MAX_WORKERS", "2"))))
+CHUNK_MAX_QUEUE_DEPTH = max(1, int(os.getenv("OMNIVOICE_CHUNK_MAX_QUEUE_DEPTH", "64")))
+CHUNK_MIN_PARALLEL_CHUNKS = max(
+    2, int(os.getenv("OMNIVOICE_CHUNK_MIN_PARALLEL_CHUNKS", "8"))
+)
+CHUNK_MIN_PARALLEL_CHARS = max(
+    1, int(os.getenv("OMNIVOICE_CHUNK_MIN_PARALLEL_CHARS", "1600"))
+)
+CHUNK_TARGET_CHARS = max(
+    64, int(os.getenv("OMNIVOICE_CHUNK_TARGET_CHARS", str(DEFAULT_SENTENCE_CHUNKING_MIN_CHARS)))
+)
+CHUNK_MIN_CHARS = max(1, int(os.getenv("OMNIVOICE_CHUNK_MIN_CHARS", "80")))
+CHUNK_MAX_CHARS = max(
+    CHUNK_TARGET_CHARS,
+    int(os.getenv("OMNIVOICE_CHUNK_MAX_CHARS", str(max(640, CHUNK_TARGET_CHARS * 3)))),
+)
+CHUNK_RETRY_COUNT = max(0, min(3, int(os.getenv("OMNIVOICE_CHUNK_RETRY_COUNT", "1"))))
+CHUNK_TIMEOUT_SECONDS = max(1.0, float(os.getenv("OMNIVOICE_CHUNK_TIMEOUT", "300")))
+CHUNK_SECONDARY_PORT_OFFSET = int(os.getenv("OMNIVOICE_CHUNK_SECONDARY_PORT_OFFSET", "1"))
+CHUNK_SECONDARY_STARTUP_TIMEOUT = max(
+    1.0, float(os.getenv("OMNIVOICE_CHUNK_SECONDARY_STARTUP_TIMEOUT", "180"))
+)
+CHUNK_MIN_FREE_GPU_MB = max(0, int(os.getenv("OMNIVOICE_CHUNK_MIN_FREE_GPU_MB", "6000")))
+CUDA_MEMORY_FRACTION = float(os.getenv("OMNIVOICE_CUDA_MEMORY_FRACTION", "0.50"))
+WORKER_MODE = os.getenv("OMNIVOICE_WORKER_MODE", "0") == "1"
 DEFAULT_ASR_MODEL_ID = os.getenv(
     "OMNIVOICE_ASR_MODEL_ID", "openai/whisper-large-v3-turbo"
 )
@@ -860,6 +890,34 @@ def _configure_logging() -> None:
     _configure_logging._configured = True
 
 
+def _cuda_device_index(device: str) -> int:
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return 0
+    if ":" not in device:
+        return torch.cuda.current_device()
+    try:
+        return int(device.split(":", 1)[1])
+    except ValueError:
+        return torch.cuda.current_device()
+
+
+def _configure_cuda_memory_fraction(device: str) -> None:
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return
+    if CUDA_MEMORY_FRACTION <= 0.0 or CUDA_MEMORY_FRACTION > 1.0:
+        return
+    try:
+        device_index = _cuda_device_index(device)
+        torch.cuda.set_per_process_memory_fraction(CUDA_MEMORY_FRACTION, device_index)
+        LOG.info(
+            "Configured CUDA memory fraction %.2f for device %s",
+            CUDA_MEMORY_FRACTION,
+            device,
+        )
+    except Exception:
+        LOG.exception("Failed to configure CUDA memory fraction for %s", device)
+
+
 DEFAULT_DEVICE = get_best_device()
 DEFAULT_ASR_DEVICE = os.getenv("OMNIVOICE_ASR_DEVICE", "cpu")
 DEFAULT_ASR_IDLE_TIMEOUT = float(os.getenv("OMNIVOICE_ASR_IDLE_TIMEOUT", "300"))
@@ -944,7 +1002,39 @@ class PreparedSpeechRequest:
     voice_ref_text: Optional[str]
     chunk_plan: list[str]
     force_sentence_chunking: bool
+    chunk_detector: str
+    parallel_workers: int
     generation_config: OmniVoiceGenerationConfig
+
+
+@dataclass(frozen=True, slots=True)
+class TextChunk:
+    chunk_id: int
+    text: str
+    worker_id: int
+
+
+@dataclass(slots=True)
+class ChunkSynthesisResult:
+    chunk_id: int
+    worker_id: int
+    input_length: int
+    waveform: torch.Tensor
+    sample_rate: int
+    retry_count: int
+    started_at: float
+    ended_at: float
+    latency_s: float
+
+
+class ChunkSynthesisError(RuntimeError):
+    def __init__(self, chunk_id: int, failure_reason: str) -> None:
+        self.chunk_id = chunk_id
+        self.failure_reason = failure_reason
+        super().__init__(
+            f"Chunk {chunk_id} failed after {CHUNK_RETRY_COUNT + 1} attempt(s): "
+            f"{failure_reason}"
+        )
 
 
 class _VoicePromptLRUCache:
@@ -987,6 +1077,7 @@ class OmniVoiceService:
         self.model: OmniVoice | None = None
         self.load_error: str | None = None
         self.load_lock: asyncio.Lock | None = None
+        self.generation_lock: asyncio.Semaphore | None = None
         self._idle_timeout = idle_timeout
         self._idle_task: asyncio.Task | None = None
         self._last_used: float = 0.0
@@ -996,6 +1087,9 @@ class OmniVoiceService:
 
     def set_lock(self, lock: asyncio.Lock) -> None:
         self.load_lock = lock
+
+    def set_generation_lock(self, lock: asyncio.Semaphore) -> None:
+        self.generation_lock = lock
 
     def _touch(self) -> None:
         self._last_used = time.monotonic()
@@ -1050,6 +1144,7 @@ class OmniVoiceService:
 
     def _load_model_sync(self) -> OmniVoice:
         LOG.info("Loading OmniVoice model %s on %s", self.model_id, self.device)
+        _configure_cuda_memory_fraction(self.device)
         if self.device.startswith("cuda"):
             from transformers import modeling_utils
 
@@ -1289,6 +1384,209 @@ class ASRService:
             "asr_load_error": self.load_error,
             "asr_idle_timeout": self._idle_timeout,
         }
+
+
+def _json_get(url: str, timeout: float = 2.0) -> dict[str, object] | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = response.read()
+        decoded = json.loads(payload.decode("utf-8"))
+        return decoded if isinstance(decoded, dict) else None
+    except Exception:
+        return None
+
+
+def _gpu_free_total_mb(device: str) -> tuple[int, int] | None:
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return None
+    try:
+        index = _cuda_device_index(device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(index)
+        return free_bytes // (1024 * 1024), total_bytes // (1024 * 1024)
+    except Exception:
+        LOG.debug("Unable to read GPU memory info for %s", device, exc_info=True)
+        return None
+
+
+def _has_secondary_worker_gpu_headroom(device: str) -> tuple[bool, str]:
+    if not device.startswith("cuda"):
+        return False, "device is not CUDA"
+    memory = _gpu_free_total_mb(device)
+    if memory is None:
+        return False, "GPU memory info unavailable"
+    free_mb, total_mb = memory
+    half_total_mb = total_mb // 2
+    required_mb = max(CHUNK_MIN_FREE_GPU_MB, half_total_mb // 2)
+    if free_mb < required_mb:
+        return (
+            False,
+            f"insufficient free GPU memory: {free_mb} MiB free, {required_mb} MiB required",
+        )
+    return True, f"{free_mb} MiB free of {total_mb} MiB"
+
+
+class SecondaryWorkerManager:
+    def __init__(self, host: str = "127.0.0.1", port: int | None = None) -> None:
+        self.host = host
+        self.port = port if port is not None else DEFAULT_PORT + CHUNK_SECONDARY_PORT_OFFSET
+        self.process: subprocess.Popen | None = None
+        self.launch_count = 0
+        self.last_failure: str | None = None
+        self._lock: asyncio.Lock | None = None
+
+    def set_lock(self, lock: asyncio.Lock) -> None:
+        self._lock = lock
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def health(self) -> dict[str, object]:
+        ready = self.is_healthy()
+        return {
+            "chunked_pipeline_enabled": CHUNKED_PIPELINE_ENABLED,
+            "chunk_worker_mode": WORKER_MODE,
+            "chunk_max_workers": CHUNK_MAX_WORKERS,
+            "chunk_max_queue_depth": CHUNK_MAX_QUEUE_DEPTH,
+            "chunk_min_parallel_chunks": CHUNK_MIN_PARALLEL_CHUNKS,
+            "chunk_min_parallel_chars": CHUNK_MIN_PARALLEL_CHARS,
+            "chunk_max_chars": CHUNK_MAX_CHARS,
+            "chunk_retry_count": CHUNK_RETRY_COUNT,
+            "secondary_worker_url": self.base_url,
+            "secondary_worker_ready": ready,
+            "secondary_worker_pid": self.process.pid if self.process is not None else None,
+            "secondary_worker_launch_count": self.launch_count,
+            "secondary_worker_last_failure": self.last_failure,
+        }
+
+    def is_healthy(self) -> bool:
+        if self.process is not None and self.process.poll() is not None:
+            return False
+        payload = _json_get(f"{self.base_url}/health", timeout=1.0)
+        return bool(payload and payload.get("status") == "ok")
+
+    async def ensure_started(self) -> bool:
+        if WORKER_MODE or not CHUNKED_PIPELINE_ENABLED or CHUNK_MAX_WORKERS < 2:
+            return False
+
+        async with self._get_lock():
+            if self.is_healthy():
+                return True
+
+            if self.process is not None and self.process.poll() is not None:
+                LOG.warning(
+                    "Secondary chunk worker exited with code %s", self.process.returncode
+                )
+                self.process = None
+            elif self.process is not None:
+                LOG.warning(
+                    "Secondary chunk worker is unhealthy but still running; restarting pid=%s",
+                    self.process.pid,
+                )
+                self.process.terminate()
+                try:
+                    await asyncio.to_thread(self.process.wait, 5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    await asyncio.to_thread(self.process.wait)
+                self.process = None
+
+            has_headroom, reason = _has_secondary_worker_gpu_headroom(service.device)
+            if not has_headroom:
+                self.last_failure = reason
+                LOG.warning("Chunked pipeline falling back to single worker: %s", reason)
+                return False
+
+            try:
+                self.process = await asyncio.to_thread(self._start_process_sync)
+                await self._wait_until_healthy()
+                self.launch_count += 1
+                self.last_failure = None
+                LOG.info(
+                    "Secondary chunk worker ready at %s (pid=%s)",
+                    self.base_url,
+                    self.process.pid if self.process is not None else "unknown",
+                )
+                return True
+            except Exception as exc:
+                self.last_failure = str(exc)
+                LOG.exception("Failed to start secondary chunk worker")
+                if self.process is not None and self.process.poll() is None:
+                    self.process.terminate()
+                self.process = None
+                return False
+
+    def _start_process_sync(self) -> subprocess.Popen:
+        log_dir = Path(os.getenv("OMNIVOICE_WORKER_LOG_DIR", "/home/op/.cache/omnivoice-pool/logs"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "chunk-worker-2.log"
+        env = os.environ.copy()
+        env.update(
+            {
+                "OMNIVOICE_WORKER_MODE": "1",
+                "OMNIVOICE_CHUNKED_PIPELINE": "0",
+                "OMNIVOICE_PORT": str(self.port),
+                "OMNIVOICE_CUDA_MEMORY_FRACTION": "0.50",
+                "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "50",
+            }
+        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "omnivoice.openai_tts_server",
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "--device",
+            service.device,
+            "--model-id",
+            service.model_id,
+            "--idle-timeout",
+            str(service._idle_timeout),
+            "--worker-mode",
+        ]
+        LOG.info("Launching secondary OmniVoice chunk worker: %s", " ".join(cmd))
+        log_file = log_path.open("ab")
+        return subprocess.Popen(
+            cmd,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    async def _wait_until_healthy(self) -> None:
+        deadline = time.monotonic() + CHUNK_SECONDARY_STARTUP_TIMEOUT
+        while time.monotonic() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                raise RuntimeError(
+                    f"secondary worker exited early with code {self.process.returncode}"
+                )
+            if self.is_healthy():
+                return
+            await asyncio.sleep(0.5)
+        raise TimeoutError(
+            f"secondary worker did not become healthy within {CHUNK_SECONDARY_STARTUP_TIMEOUT:.1f}s"
+        )
+
+    async def shutdown(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        LOG.info("Stopping secondary chunk worker pid=%s", self.process.pid)
+        self.process.terminate()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self.process.wait), timeout=10)
+        except asyncio.TimeoutError:
+            self.process.kill()
+            await asyncio.to_thread(self.process.wait)
+        self.process = None
 
 
 def _protect_bracket_tags(text: str) -> tuple[str, dict[str, str]]:
@@ -1663,15 +1961,249 @@ def sanitize_prompt_text(text: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
-def _plan_sentence_chunks(text: str, min_chars: int) -> list[str]:
-    if len(text) <= min_chars:
-        return [text]
-    planned = chunk_text_punctuation(
-        text=text,
-        chunk_len=min_chars,
-        min_chunk_len=max(24, min_chars // 4),
+def _split_sentences_pysbd(text: str) -> list[str] | None:
+    try:
+        import pysbd  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        segmenter = pysbd.Segmenter(language="en", clean=False)
+        sentences = [item.strip() for item in segmenter.segment(text) if item.strip()]
+        return sentences or None
+    except Exception:
+        LOG.debug("pysbd sentence detection failed", exc_info=True)
+        return None
+
+
+def _split_sentences_nltk(text: str) -> list[str] | None:
+    try:
+        from nltk.tokenize import sent_tokenize  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        sentences = [item.strip() for item in sent_tokenize(text) if item.strip()]
+        return sentences or None
+    except LookupError:
+        return None
+    except Exception:
+        LOG.debug("nltk sentence detection failed", exc_info=True)
+        return None
+
+
+def _looks_like_decimal_period(text: str, index: int) -> bool:
+    return (
+        index > 0
+        and index + 1 < len(text)
+        and text[index - 1].isdigit()
+        and text[index + 1].isdigit()
     )
-    return planned or [text]
+
+
+def _looks_like_abbreviation_period(text: str, index: int) -> bool:
+    prefix = text[: index + 1].rstrip()
+    if not prefix:
+        return False
+    last_word = prefix.split()[-1]
+    if last_word in ABBREVIATIONS:
+        return True
+    # Initialisms such as "U.S." or "D.C." should stay in the current sentence.
+    return bool(re.fullmatch(r"(?:[A-Za-z]\.){2,}", last_word))
+
+
+def _split_sentences_regex(text: str) -> list[str]:
+    sentences: list[str] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char not in ".!?。！？…":
+            index += 1
+            continue
+
+        if char == "." and (
+            _looks_like_decimal_period(text, index)
+            or _looks_like_abbreviation_period(text, index)
+        ):
+            index += 1
+            continue
+
+        # Treat a run of dots or unicode ellipsis as one boundary.
+        end = index + 1
+        while end < len(text) and text[end] in ".…":
+            end += 1
+        while end < len(text) and text[end] in CLOSING_MARKS:
+            end += 1
+
+        piece = text[start:end].strip()
+        if piece:
+            sentences.append(piece)
+        start = end
+        while start < len(text) and text[start].isspace():
+            start += 1
+        index = start
+
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences or ([text.strip()] if text.strip() else [])
+
+
+def _detect_sentences(text: str) -> tuple[list[str], str]:
+    if not text.strip():
+        return [], "empty"
+    for source, splitter in (
+        ("pysbd", _split_sentences_pysbd),
+        ("nltk", _split_sentences_nltk),
+    ):
+        sentences = splitter(text)
+        if sentences:
+            return sentences, source
+    return _split_sentences_regex(text), "regex"
+
+
+def _split_long_chunk_by_budget(text: str, max_chars: int) -> list[str]:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    parts: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for word in text.split(" "):
+        word_len = len(word)
+        next_len = current_len + (1 if current else 0) + word_len
+        if current and next_len > max_chars:
+            parts.append(" ".join(current).strip())
+            current = [word]
+            current_len = word_len
+        elif word_len > max_chars:
+            if current:
+                parts.append(" ".join(current).strip())
+                current = []
+                current_len = 0
+            for start in range(0, word_len, max_chars):
+                parts.append(word[start : start + max_chars])
+        else:
+            current.append(word)
+            current_len = next_len
+    if current:
+        parts.append(" ".join(current).strip())
+    return [part for part in parts if part]
+
+
+def _merge_short_sentence_chunks(
+    sentences: list[str],
+    *,
+    min_chars: int,
+    target_chars: int,
+    max_chars: int,
+) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+
+    for sentence in sentences:
+        for part in _split_long_chunk_by_budget(sentence, max_chars):
+            if not current:
+                current = part
+                continue
+
+            candidate = f"{current} {part}".strip()
+            if len(current) < min_chars or len(candidate) <= target_chars:
+                current = candidate
+            else:
+                chunks.append(current)
+                current = part
+
+    if current:
+        chunks.append(current)
+
+    # If the final chunk is tiny, fold it back into the previous chunk when
+    # doing so stays within the hard budget. This avoids one-word tail chunks.
+    if len(chunks) > 1 and len(chunks[-1]) < min_chars:
+        candidate = f"{chunks[-2]} {chunks[-1]}".strip()
+        if len(candidate) <= max_chars:
+            chunks[-2] = candidate
+            chunks.pop()
+
+    return chunks
+
+
+def _rebalance_interleaved_chunks(chunks: list[str], max_chars: int) -> list[str]:
+    """Reduce odd/even worker skew without changing text order."""
+    if len(chunks) < 4:
+        return chunks
+
+    def loads(values: list[str]) -> tuple[int, int]:
+        return (
+            sum(len(value) for index, value in enumerate(values) if index % 2 == 0),
+            sum(len(value) for index, value in enumerate(values) if index % 2 == 1),
+        )
+
+    balanced = list(chunks)
+    for _ in range(4):
+        worker_1_load, worker_2_load = loads(balanced)
+        skew = abs(worker_1_load - worker_2_load)
+        if skew <= max_chars:
+            break
+        heavy_parity = 0 if worker_1_load > worker_2_load else 1
+        candidate_indices = [
+            index
+            for index, value in enumerate(balanced)
+            if index % 2 == heavy_parity and len(value) > max_chars // 2
+        ]
+        if not candidate_indices:
+            break
+        split_index = max(candidate_indices, key=lambda index: len(balanced[index]))
+        parts = _split_long_chunk_by_budget(balanced[split_index], max(1, len(balanced[split_index]) // 2))
+        if len(parts) < 2:
+            break
+        balanced = balanced[:split_index] + parts + balanced[split_index + 1 :]
+
+    return balanced
+
+
+def _plan_sentence_chunks_with_source(text: str, min_chars: int) -> tuple[list[str], str]:
+    if len(text) <= min_chars:
+        return [text], "none"
+
+    sentences, detector = _detect_sentences(text)
+    if not sentences:
+        return [text], detector
+
+    target_chars = max(min_chars, CHUNK_TARGET_CHARS)
+    planned = _merge_short_sentence_chunks(
+        sentences,
+        min_chars=max(CHUNK_MIN_CHARS, min_chars // 3),
+        target_chars=target_chars,
+        max_chars=CHUNK_MAX_CHARS,
+    )
+    planned = _rebalance_interleaved_chunks(planned, CHUNK_MAX_CHARS)
+    if len(planned) > CHUNK_MAX_QUEUE_DEPTH:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Input produced {len(planned)} chunks, exceeding queue cap "
+                f"{CHUNK_MAX_QUEUE_DEPTH}."
+            ),
+        )
+    return planned or [text], detector
+
+
+def _plan_sentence_chunks(text: str, min_chars: int) -> list[str]:
+    chunks, _ = _plan_sentence_chunks_with_source(text, min_chars)
+    return chunks
+
+
+def _build_text_chunks(chunks: list[str]) -> list[TextChunk]:
+    non_empty_chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
+    return [
+        TextChunk(
+            chunk_id=index + 1,
+            text=chunk,
+            worker_id=1 if index % 2 == 0 else 2,
+        )
+        for index, chunk in enumerate(non_empty_chunks)
+    ]
 
 
 def _supported_models() -> list[dict[str, str]]:
@@ -2058,7 +2590,9 @@ def _prepare_request(payload: SpeechRequest) -> PreparedSpeechRequest:
         else sanitize_prompt_text(resolved_voice.ref_text)
     )
     ref_text = resolved_ref_text if resolved_voice.ref_audio_path is None else None
-    chunk_plan = _plan_sentence_chunks(text, payload.sentence_chunking_min_chars)
+    chunk_plan, chunk_detector = _plan_sentence_chunks_with_source(
+        text, payload.sentence_chunking_min_chars
+    )
     force_sentence_chunking = payload.sentence_chunking and len(chunk_plan) > 1
 
     generation_config_kwargs: dict[str, object] = {}
@@ -2105,6 +2639,8 @@ def _prepare_request(payload: SpeechRequest) -> PreparedSpeechRequest:
         else None,
         chunk_plan=chunk_plan,
         force_sentence_chunking=force_sentence_chunking,
+        chunk_detector=chunk_detector,
+        parallel_workers=1,
         generation_config=OmniVoiceGenerationConfig.from_dict(generation_config_kwargs),
     )
 
@@ -2197,12 +2733,44 @@ def _waveform_to_bytes(
     return result.stdout, media_type
 
 
-async def _synthesize_prepared(
+def _wav_bytes_to_waveform(wav_bytes: bytes) -> tuple[torch.Tensor, int]:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width != 2:
+        audio_buffer = io.BytesIO(wav_bytes)
+        waveform, decoded_sample_rate = torchaudio.load(audio_buffer)
+        return waveform, int(decoded_sample_rate)
+
+    samples = torch.frombuffer(frames, dtype=torch.int16).clone().float() / 32767.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).transpose(0, 1).contiguous()
+    else:
+        samples = samples.unsqueeze(0)
+    return samples, int(sample_rate)
+
+
+def _speech_payload_for_chunk(payload: SpeechRequest, chunk: TextChunk) -> dict[str, object]:
+    body = payload.model_dump(mode="json", exclude_none=True)
+    body["input"] = chunk.text
+    body.pop("text", None)
+    body["response_format"] = "wav"
+    body["sentence_chunking"] = False
+    # A total-request duration cannot be applied independently to each chunk.
+    body.pop("duration", None)
+    return body
+
+
+async def _synthesize_prepared_waveform(
     prepared: PreparedSpeechRequest,
     payload: SpeechRequest,
     *,
     request_id: Optional[str] = None,
-) -> tuple[PreparedSpeechRequest, bytes, str]:
+    worker_id: int = 1,
+) -> tuple[torch.Tensor, int]:
     model = await service.get_model()
 
     generation_kwargs: dict[str, object] = {
@@ -2231,7 +2799,7 @@ async def _synthesize_prepared(
     )
     LOG.debug("Sanitized input preview: %s", prepared.text[:200])
 
-    def _run_generation() -> tuple[bytes, str]:
+    def _run_generation() -> tuple[torch.Tensor, int]:
         generation_args = dict(generation_kwargs)
         if prepared.voice_ref_audio_path is not None:
             generation_args["voice_clone_prompt"] = (
@@ -2248,21 +2816,20 @@ async def _synthesize_prepared(
             audios = model.generate(**generation_args)
         if not audios:
             raise RuntimeError("OmniVoice returned no audio")
-        waveform = audios[0]
-        return _waveform_to_bytes(
-            waveform,
-            int(model.sampling_rate),
-            prepared.response_format,
-        )
+        return audios[0], int(model.sampling_rate)
 
     try:
-        audio_bytes, media_type = await asyncio.to_thread(_run_generation)
+        if service.generation_lock is not None:
+            async with service.generation_lock:
+                return await asyncio.to_thread(_run_generation)
+        return await asyncio.to_thread(_run_generation)
     except HTTPException:
         raise
     except Exception as exc:
         LOG.exception(
-            "Speech synthesis failed (request_id=%s, voice=%s, voice_source=%s, language=%s)",
+            "Speech synthesis failed (request_id=%s, worker_id=%s, voice=%s, voice_source=%s, language=%s)",
             request_id or "n/a",
+            worker_id,
             prepared.voice_id,
             "local-reference"
             if prepared.voice_ref_audio_path is not None
@@ -2271,6 +2838,335 @@ async def _synthesize_prepared(
         )
         raise HTTPException(status_code=500, detail="Speech synthesis failed") from exc
 
+
+async def _synthesize_chunk_local(
+    chunk: TextChunk,
+    prepared: PreparedSpeechRequest,
+    payload: SpeechRequest,
+    *,
+    request_id: str,
+    retry_count: int,
+) -> ChunkSynthesisResult:
+    chunk_prepared = replace(
+        prepared,
+        text=chunk.text,
+        response_format="wav",
+        chunk_plan=[chunk.text],
+        force_sentence_chunking=False,
+        parallel_workers=prepared.parallel_workers,
+        generation_config=replace(
+            prepared.generation_config,
+            audio_chunk_threshold=(
+                payload.audio_chunk_threshold
+                if payload.audio_chunk_threshold is not None
+                else DEFAULT_AUDIO_CHUNK_THRESHOLD
+            ),
+        ),
+    )
+    started_at = time.time()
+    start = time.perf_counter()
+    waveform, sample_rate = await _synthesize_prepared_waveform(
+        chunk_prepared,
+        payload,
+        request_id=request_id,
+        worker_id=1,
+    )
+    ended_at = time.time()
+    latency_s = time.perf_counter() - start
+    return ChunkSynthesisResult(
+        chunk_id=chunk.chunk_id,
+        worker_id=1,
+        input_length=len(chunk.text),
+        waveform=waveform,
+        sample_rate=sample_rate,
+        retry_count=retry_count,
+        started_at=started_at,
+        ended_at=ended_at,
+        latency_s=latency_s,
+    )
+
+
+async def _synthesize_chunk_remote(
+    chunk: TextChunk,
+    payload: SpeechRequest,
+    *,
+    request_id: str,
+    retry_count: int,
+) -> ChunkSynthesisResult:
+    body = _speech_payload_for_chunk(payload, chunk)
+    url = f"{secondary_worker_manager.base_url}/v1/audio/speech"
+    started_at = time.time()
+    start = time.perf_counter()
+
+    def _post() -> bytes:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-OmniVoice-Parent-Request-Id": request_id,
+                "X-OmniVoice-Chunk-Id": str(chunk.chunk_id),
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=CHUNK_TIMEOUT_SECONDS) as response:
+            return response.read()
+
+    wav_bytes = await asyncio.to_thread(_post)
+    waveform, sample_rate = _wav_bytes_to_waveform(wav_bytes)
+    ended_at = time.time()
+    latency_s = time.perf_counter() - start
+    return ChunkSynthesisResult(
+        chunk_id=chunk.chunk_id,
+        worker_id=2,
+        input_length=len(chunk.text),
+        waveform=waveform,
+        sample_rate=sample_rate,
+        retry_count=retry_count,
+        started_at=started_at,
+        ended_at=ended_at,
+        latency_s=latency_s,
+    )
+
+
+async def _run_chunk_on_worker(
+    worker_id: int,
+    chunk: TextChunk,
+    prepared: PreparedSpeechRequest,
+    payload: SpeechRequest,
+    *,
+    request_id: str,
+    retry_count: int,
+) -> ChunkSynthesisResult:
+    if worker_id == 2:
+        return await _synthesize_chunk_remote(
+            chunk,
+            payload,
+            request_id=request_id,
+            retry_count=retry_count,
+        )
+    return await _synthesize_chunk_local(
+        chunk,
+        prepared,
+        payload,
+        request_id=request_id,
+        retry_count=retry_count,
+    )
+
+
+async def _process_chunk_with_retry(
+    chunk: TextChunk,
+    prepared: PreparedSpeechRequest,
+    payload: SpeechRequest,
+    *,
+    request_id: str,
+    secondary_available: bool,
+) -> ChunkSynthesisResult:
+    preferred = chunk.worker_id if secondary_available else 1
+    alternate = 1 if preferred == 2 else 2
+    worker_order = [preferred]
+    if secondary_available and alternate not in worker_order:
+        worker_order.append(alternate)
+    if 1 not in worker_order:
+        worker_order.append(1)
+
+    failure_reason = "unknown"
+    for attempt in range(CHUNK_RETRY_COUNT + 1):
+        worker_id = worker_order[min(attempt, len(worker_order) - 1)]
+        try:
+            result = await asyncio.wait_for(
+                _run_chunk_on_worker(
+                    worker_id,
+                    chunk,
+                    prepared,
+                    payload,
+                    request_id=request_id,
+                    retry_count=attempt,
+                ),
+                timeout=CHUNK_TIMEOUT_SECONDS,
+            )
+            LOG.info(
+                "chunk_id=%s worker_id=%s input_length=%s start_time=%.6f end_time=%.6f latency=%.3fs retry_count=%s failure_reason=-",
+                result.chunk_id,
+                result.worker_id,
+                result.input_length,
+                result.started_at,
+                result.ended_at,
+                result.latency_s,
+                result.retry_count,
+            )
+            return result
+        except asyncio.CancelledError:
+            LOG.info(
+                "chunk_id=%s worker_id=%s input_length=%s retry_count=%s cancelled",
+                chunk.chunk_id,
+                worker_id,
+                len(chunk.text),
+                attempt,
+            )
+            raise
+        except Exception as exc:
+            failure_reason = str(exc) or exc.__class__.__name__
+            LOG.warning(
+                "chunk_id=%s worker_id=%s input_length=%s retry_count=%s failure_reason=%s",
+                chunk.chunk_id,
+                worker_id,
+                len(chunk.text),
+                attempt,
+                failure_reason,
+            )
+            if attempt >= CHUNK_RETRY_COUNT:
+                break
+    raise ChunkSynthesisError(chunk.chunk_id, failure_reason)
+
+
+async def _iter_ordered_chunk_results(
+    chunks: list[TextChunk],
+    prepared: PreparedSpeechRequest,
+    payload: SpeechRequest,
+    *,
+    request_id: str,
+    secondary_available: bool,
+):
+    if len(chunks) > CHUNK_MAX_QUEUE_DEPTH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Chunk queue depth {len(chunks)} exceeds cap {CHUNK_MAX_QUEUE_DEPTH}",
+        )
+
+    semaphore = asyncio.Semaphore(CHUNK_MAX_WORKERS if secondary_available else 1)
+
+    async def _run(chunk: TextChunk) -> ChunkSynthesisResult:
+        async with semaphore:
+            return await _process_chunk_with_retry(
+                chunk,
+                prepared,
+                payload,
+                request_id=request_id,
+                secondary_available=secondary_available,
+            )
+
+    tasks = [asyncio.create_task(_run(chunk)) for chunk in chunks]
+    reorder_buffer: dict[int, ChunkSynthesisResult] = {}
+    next_chunk_id = 1
+
+    try:
+        for completed in asyncio.as_completed(tasks):
+            result = await completed
+            reorder_buffer[result.chunk_id] = result
+            while next_chunk_id in reorder_buffer:
+                yield reorder_buffer.pop(next_chunk_id)
+                next_chunk_id += 1
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        raise
+    except Exception:
+        for task in tasks:
+            task.cancel()
+        raise
+    finally:
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _should_use_parallel_chunking(
+    prepared: PreparedSpeechRequest,
+    payload: SpeechRequest,
+) -> bool:
+    if WORKER_MODE or not CHUNKED_PIPELINE_ENABLED:
+        return False
+    if CHUNK_MAX_WORKERS < 2:
+        return False
+    if payload.duration is not None:
+        return False
+    if not payload.sentence_chunking or not prepared.force_sentence_chunking:
+        return False
+    if len(prepared.text) < CHUNK_MIN_PARALLEL_CHARS:
+        return False
+    return len(prepared.chunk_plan) >= CHUNK_MIN_PARALLEL_CHUNKS
+
+
+async def _try_synthesize_chunked(
+    prepared: PreparedSpeechRequest,
+    payload: SpeechRequest,
+    *,
+    request_id: str,
+) -> tuple[bytes, str] | None:
+    if not _should_use_parallel_chunking(prepared, payload):
+        return None
+
+    chunks = _build_text_chunks(prepared.chunk_plan)
+    if len(chunks) < CHUNK_MIN_PARALLEL_CHUNKS:
+        return None
+
+    secondary_available = await secondary_worker_manager.ensure_started()
+    if not secondary_available:
+        return None
+
+    prepared.parallel_workers = 2
+    LOG.info(
+        "Dispatching %d text chunks across two workers (request_id=%s, detector=%s)",
+        len(chunks),
+        request_id,
+        prepared.chunk_detector,
+    )
+
+    waveforms: list[torch.Tensor] = []
+    sample_rate: int | None = None
+    try:
+        async for result in _iter_ordered_chunk_results(
+            chunks,
+            prepared,
+            payload,
+            request_id=request_id,
+            secondary_available=secondary_available,
+        ):
+            waveforms.append(result.waveform)
+            sample_rate = result.sample_rate if sample_rate is None else sample_rate
+    except ChunkSynthesisError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not waveforms or sample_rate is None:
+        raise HTTPException(status_code=500, detail="Chunked synthesis returned no audio")
+
+    merged = cross_fade_chunks(waveforms, sample_rate)
+    return await asyncio.to_thread(
+        _waveform_to_bytes,
+        merged,
+        sample_rate,
+        prepared.response_format,
+    )
+
+
+async def _synthesize_prepared(
+    prepared: PreparedSpeechRequest,
+    payload: SpeechRequest,
+    *,
+    request_id: Optional[str] = None,
+) -> tuple[PreparedSpeechRequest, bytes, str]:
+    effective_request_id = request_id or uuid4().hex[:12]
+    chunked = await _try_synthesize_chunked(
+        prepared,
+        payload,
+        request_id=effective_request_id,
+    )
+    if chunked is not None:
+        audio_bytes, media_type = chunked
+        return prepared, audio_bytes, media_type
+
+    waveform, sample_rate = await _synthesize_prepared_waveform(
+        prepared,
+        payload,
+        request_id=effective_request_id,
+        worker_id=1,
+    )
+    audio_bytes, media_type = await asyncio.to_thread(
+        _waveform_to_bytes,
+        waveform,
+        sample_rate,
+        prepared.response_format,
+    )
     return prepared, audio_bytes, media_type
 
 
@@ -2278,9 +3174,11 @@ async def _synthesize_prepared(
 async def lifespan(_: FastAPI):
     _configure_logging()
     service.set_lock(asyncio.Lock())
+    service.set_generation_lock(asyncio.Semaphore(1))
     asr_service.set_lock(asyncio.Lock())
+    secondary_worker_manager.set_lock(asyncio.Lock())
     LOG.info(
-        "Starting OmniVoice TTS server (api_model=%s, backend_model=%s, device=%s, idle_timeout=%.0fs, asr_model=%s, asr_device=%s, asr_idle_timeout=%.0fs)",
+        "Starting OmniVoice TTS server (api_model=%s, backend_model=%s, device=%s, idle_timeout=%.0fs, asr_model=%s, asr_device=%s, asr_idle_timeout=%.0fs, worker_mode=%s, chunked_pipeline=%s, chunk_max_workers=%s)",
         API_MODEL_ID,
         service.model_id,
         service.device,
@@ -2288,8 +3186,12 @@ async def lifespan(_: FastAPI):
         asr_service.model_id,
         asr_service.device,
         asr_service._idle_timeout,
+        WORKER_MODE,
+        CHUNKED_PIPELINE_ENABLED,
+        CHUNK_MAX_WORKERS,
     )
     yield
+    await secondary_worker_manager.shutdown()
     if service._idle_task is not None:
         service._idle_task.cancel()
     if asr_service._idle_task is not None:
@@ -2317,6 +3219,7 @@ asr_service = ASRService(
     DEFAULT_ASR_DEVICE,
     idle_timeout=DEFAULT_ASR_IDLE_TIMEOUT,
 )
+secondary_worker_manager = SecondaryWorkerManager()
 app = FastAPI(title="OmniVoice OpenAI-Compatible TTS", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -2375,6 +3278,7 @@ async def health() -> dict[str, object]:
         ),
         **service.health(),
         **asr_service.health(),
+        "chunked_pipeline": secondary_worker_manager.health(),
     }
 
 
@@ -2462,6 +3366,8 @@ async def audio_speech(payload: SpeechRequest, request: Request) -> Response:
         "Content-Disposition": f'attachment; filename="speech.{suffix}"',
         "X-OmniVoice-Text-Chunks": str(len(prepared.chunk_plan)),
         "X-OmniVoice-Forced-Chunking": str(prepared.force_sentence_chunking).lower(),
+        "X-OmniVoice-Sentence-Detector": prepared.chunk_detector,
+        "X-OmniVoice-Parallel-Workers": str(prepared.parallel_workers),
         "X-OmniVoice-Voice-Mode": voice_mode,
         "X-OmniVoice-Sanitized-Chars": str(len(prepared.text)),
         "X-OmniVoice-Language": prepared.language or "",
@@ -2547,12 +3453,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(os.getenv("OMNIVOICE_IDLE_TIMEOUT", "300")),
         help="Seconds of inactivity before offloading model from GPU (0 to disable)",
     )
+    parser.add_argument(
+        "--worker-mode",
+        action="store_true",
+        default=WORKER_MODE,
+        help="Run as an internal chunk worker and never launch another worker",
+    )
     return parser
 
 
 def main() -> None:
     _configure_logging()
     args = build_parser().parse_args()
+
+    global WORKER_MODE
+    WORKER_MODE = bool(args.worker_mode)
+    if WORKER_MODE:
+        os.environ["OMNIVOICE_WORKER_MODE"] = "1"
 
     global service
     service = OmniVoiceService(
@@ -2564,14 +3481,18 @@ def main() -> None:
         DEFAULT_ASR_DEVICE,
         idle_timeout=DEFAULT_ASR_IDLE_TIMEOUT,
     )
+    global secondary_worker_manager
+    secondary_worker_manager = SecondaryWorkerManager(port=args.port + CHUNK_SECONDARY_PORT_OFFSET)
 
     uvicorn.run(
         app,
         host=args.host,
         port=args.port,
         log_level="info",
-        access_log=True,
+        access_log=False,
         workers=1,
+        loop="uvloop",
+        http="httptools",
     )
 
 

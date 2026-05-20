@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -6,14 +7,30 @@ from fastapi.testclient import TestClient
 
 from omnivoice.openai_tts_server import (
     DEFAULT_AUDIO_CHUNK_THRESHOLD,
+    ChunkSynthesisError,
+    ChunkSynthesisResult,
+    SecondaryWorkerManager,
+    SpeechRequest,
+    TextChunk,
     TextSanitizationOptions,
     VOICE_LOOKUP,
+    _build_text_chunks,
+    _detect_sentences,
+    _has_secondary_worker_gpu_headroom,
+    _iter_ordered_chunk_results,
+    _plan_sentence_chunks_with_source,
+    _prepare_request,
+    _process_chunk_with_retry,
     _resolve_voice,
+    _should_use_parallel_chunking,
+    _split_long_chunk_by_budget,
+    _synthesize_chunk_local,
     _supported_models,
     _supported_voices,
     app,
     sanitize_prompt_text,
     sanitize_speech_text,
+    secondary_worker_manager,
     service,
 )
 
@@ -99,6 +116,11 @@ class OpenAITTSServerTests(unittest.TestCase):
 
         with (
             patch.object(service, "get_model", new=AsyncMock(return_value=fake_model)),
+            patch.object(
+                secondary_worker_manager,
+                "ensure_started",
+                new=AsyncMock(return_value=False),
+            ),
             patch(
                 "omnivoice.openai_tts_server._waveform_to_bytes",
                 return_value=(b"audio-bytes", "audio/mpeg"),
@@ -243,6 +265,343 @@ class OpenAITTSServerTests(unittest.TestCase):
         self.assertIn("OpenAI-compatible TTS", response.text)
         self.assertIn("british_man", response.text)
         self.assertIn("cordobes_man", response.text)
+
+
+class ChunkPlannerTests(unittest.TestCase):
+    def test_sentence_detector_handles_abbreviations_decimals_ellipses_and_multilingual_punctuation(
+        self,
+    ) -> None:
+        text = "Dr. Smith measured 3.14 cm. Wait... really? Hola! 你好。"
+        with (
+            patch("omnivoice.openai_tts_server._split_sentences_pysbd", return_value=None),
+            patch("omnivoice.openai_tts_server._split_sentences_nltk", return_value=None),
+        ):
+            sentences, source = _detect_sentences(text)
+
+        self.assertEqual(source, "regex")
+        self.assertEqual(
+            sentences,
+            ["Dr. Smith measured 3.14 cm.", "Wait...", "really?", "Hola!", "你好。"],
+        )
+
+    def test_empty_chunks_are_removed_before_deterministic_ids_are_assigned(self) -> None:
+        chunks = _build_text_chunks(["First.", " ", "", "Second.", "Third."])
+
+        self.assertEqual([chunk.chunk_id for chunk in chunks], [1, 2, 3])
+        self.assertEqual([chunk.worker_id for chunk in chunks], [1, 2, 1])
+        self.assertEqual([chunk.text for chunk in chunks], ["First.", "Second.", "Third."])
+
+    def test_long_chunks_split_by_character_budget(self) -> None:
+        parts = _split_long_chunk_by_budget("alpha beta gamma delta epsilon", 12)
+
+        self.assertTrue(all(len(part) <= 12 for part in parts))
+        self.assertEqual(" ".join(parts), "alpha beta gamma delta epsilon")
+
+    def test_adaptive_planner_merges_short_sentences_and_caps_queue(self) -> None:
+        text = "Hi. Ok. This sentence is long enough to carry the first two."
+        with (
+            patch("omnivoice.openai_tts_server._split_sentences_pysbd", return_value=None),
+            patch("omnivoice.openai_tts_server._split_sentences_nltk", return_value=None),
+        ):
+            chunks, source = _plan_sentence_chunks_with_source(text, min_chars=32)
+
+        self.assertEqual(source, "regex")
+        self.assertEqual(chunks, [text])
+
+
+class ChunkedPipelineTests(unittest.IsolatedAsyncioTestCase):
+    def _prepared_and_payload(self) -> tuple[object, SpeechRequest]:
+        payload = SpeechRequest(
+            input="One sentence. Two sentence. Three sentence.",
+            voice="alloy",
+            response_format="wav",
+            sentence_chunking_min_chars=64,
+        )
+        return _prepare_request(payload), payload
+
+    async def test_out_of_order_completion_streams_in_original_order(self) -> None:
+        prepared, payload = self._prepared_and_payload()
+        chunks = _build_text_chunks(["One.", "Two.", "Three."])
+        delays = {1: 0.05, 2: 0.01, 3: 0.02}
+
+        async def fake_run(worker_id, chunk, prepared, payload, *, request_id, retry_count):
+            await asyncio.sleep(delays[chunk.chunk_id])
+            now = asyncio.get_running_loop().time()
+            return ChunkSynthesisResult(
+                chunk_id=chunk.chunk_id,
+                worker_id=worker_id,
+                input_length=len(chunk.text),
+                waveform=torch.full((1, 1), float(chunk.chunk_id)),
+                sample_rate=24000,
+                retry_count=retry_count,
+                started_at=now,
+                ended_at=now,
+                latency_s=0.0,
+            )
+
+        seen: list[int] = []
+        with patch("omnivoice.openai_tts_server._run_chunk_on_worker", new=fake_run):
+            async for result in _iter_ordered_chunk_results(
+                chunks,
+                prepared,
+                payload,
+                request_id="test",
+                secondary_available=True,
+            ):
+                seen.append(result.chunk_id)
+
+        self.assertEqual(seen, [1, 2, 3])
+
+    async def test_failed_chunk_retries_once_on_other_worker(self) -> None:
+        prepared, payload = self._prepared_and_payload()
+        chunk = TextChunk(chunk_id=1, text="One.", worker_id=1)
+        calls: list[tuple[int, int]] = []
+
+        async def fake_run(worker_id, chunk, prepared, payload, *, request_id, retry_count):
+            calls.append((worker_id, retry_count))
+            if retry_count == 0:
+                raise RuntimeError("worker crashed")
+            now = asyncio.get_running_loop().time()
+            return ChunkSynthesisResult(
+                chunk_id=chunk.chunk_id,
+                worker_id=worker_id,
+                input_length=len(chunk.text),
+                waveform=torch.zeros(1, 1),
+                sample_rate=24000,
+                retry_count=retry_count,
+                started_at=now,
+                ended_at=now,
+                latency_s=0.0,
+            )
+
+        with patch("omnivoice.openai_tts_server._run_chunk_on_worker", new=fake_run):
+            result = await _process_chunk_with_retry(
+                chunk,
+                prepared,
+                payload,
+                request_id="test",
+                secondary_available=True,
+            )
+
+        self.assertEqual(calls, [(1, 0), (2, 1)])
+        self.assertEqual(result.worker_id, 2)
+        self.assertEqual(result.retry_count, 1)
+
+    async def test_worker_crash_propagates_clear_error_after_retry(self) -> None:
+        prepared, payload = self._prepared_and_payload()
+        chunk = TextChunk(chunk_id=2, text="Two.", worker_id=2)
+
+        async def fake_run(worker_id, chunk, prepared, payload, *, request_id, retry_count):
+            raise RuntimeError("boom")
+
+        with patch("omnivoice.openai_tts_server._run_chunk_on_worker", new=fake_run):
+            with self.assertRaises(ChunkSynthesisError) as caught:
+                await _process_chunk_with_retry(
+                    chunk,
+                    prepared,
+                    payload,
+                    request_id="test",
+                    secondary_available=True,
+                )
+
+        self.assertIn("Chunk 2 failed", str(caught.exception))
+        self.assertIn("boom", str(caught.exception))
+
+    async def test_cancellation_mid_stream_cancels_queued_tasks(self) -> None:
+        prepared, payload = self._prepared_and_payload()
+        chunks = _build_text_chunks(["One.", "Two.", "Three."])
+        started = asyncio.Event()
+
+        async def fake_run(worker_id, chunk, prepared, payload, *, request_id, retry_count):
+            started.set()
+            await asyncio.sleep(60)
+
+        async def collect() -> list[int]:
+            result_ids: list[int] = []
+            async for result in _iter_ordered_chunk_results(
+                chunks,
+                prepared,
+                payload,
+                request_id="test",
+                secondary_available=True,
+            ):
+                result_ids.append(result.chunk_id)
+            return result_ids
+
+        with patch("omnivoice.openai_tts_server._run_chunk_on_worker", new=fake_run):
+            task = asyncio.create_task(collect())
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+    async def test_concurrent_ensure_started_launches_only_one_secondary_worker(self) -> None:
+        manager = SecondaryWorkerManager(port=59999)
+        manager.set_lock(asyncio.Lock())
+        launched = 0
+        healthy = False
+
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_start():
+            nonlocal launched, healthy
+            launched += 1
+            healthy = True
+            return FakeProcess()
+
+        def fake_healthy():
+            return healthy
+
+        with (
+            patch("omnivoice.openai_tts_server._has_secondary_worker_gpu_headroom", return_value=(True, "ok")),
+            patch.object(manager, "_start_process_sync", side_effect=fake_start),
+            patch.object(manager, "_wait_until_healthy", new=AsyncMock(return_value=None)),
+            patch.object(manager, "is_healthy", side_effect=fake_healthy),
+        ):
+            results = await asyncio.gather(*(manager.ensure_started() for _ in range(8)))
+
+        self.assertTrue(all(results))
+        self.assertEqual(launched, 1)
+
+    async def test_unhealthy_running_secondary_worker_is_terminated_before_restart(
+        self,
+    ) -> None:
+        manager = SecondaryWorkerManager(port=59999)
+        manager.set_lock(asyncio.Lock())
+
+        class FakeProcess:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        old_process = FakeProcess(111)
+        new_process = FakeProcess(222)
+        manager.process = old_process
+
+        with (
+            patch(
+                "omnivoice.openai_tts_server._has_secondary_worker_gpu_headroom",
+                return_value=(True, "ok"),
+            ),
+            patch.object(manager, "is_healthy", return_value=False),
+            patch.object(manager, "_start_process_sync", return_value=new_process),
+            patch.object(manager, "_wait_until_healthy", new=AsyncMock(return_value=None)),
+        ):
+            result = await manager.ensure_started()
+
+        self.assertTrue(result)
+        self.assertTrue(old_process.terminated)
+        self.assertFalse(old_process.killed)
+        self.assertIs(manager.process, new_process)
+        self.assertEqual(manager.launch_count, 1)
+
+    def test_gpu_fallback_path_reports_no_cuda_headroom(self) -> None:
+        with patch("torch.cuda.is_available", return_value=False):
+            available, reason = _has_secondary_worker_gpu_headroom("cuda:0")
+
+        self.assertFalse(available)
+        self.assertIn("unavailable", reason.lower())
+
+    async def test_local_chunk_synthesis_uses_chunk_local_threshold(self) -> None:
+        payload = SpeechRequest(
+            input="One sentence. Two sentence.",
+            voice="alloy",
+            response_format="wav",
+        )
+        prepared = _prepare_request(payload)
+        prepared.chunk_plan = ["One sentence.", "Two sentence."]
+        prepared.force_sentence_chunking = True
+        prepared.generation_config.audio_chunk_threshold = 0.0
+        chunk = TextChunk(chunk_id=1, text="One sentence.", worker_id=1)
+
+        captured: dict[str, object] = {}
+
+        async def fake_synthesize_waveform(
+            chunk_prepared,
+            payload_arg,
+            *,
+            request_id=None,
+            worker_id=1,
+        ):
+            captured["prepared"] = chunk_prepared
+            captured["payload"] = payload_arg
+            captured["request_id"] = request_id
+            captured["worker_id"] = worker_id
+            return torch.zeros(1, 1), 24000
+
+        with patch(
+            "omnivoice.openai_tts_server._synthesize_prepared_waveform",
+            new=fake_synthesize_waveform,
+        ):
+            result = await _synthesize_chunk_local(
+                chunk,
+                prepared,
+                payload,
+                request_id="test",
+                retry_count=0,
+            )
+
+        chunk_prepared = captured["prepared"]
+        self.assertEqual(chunk_prepared.text, chunk.text)
+        self.assertEqual(chunk_prepared.chunk_plan, [chunk.text])
+        self.assertFalse(chunk_prepared.force_sentence_chunking)
+        self.assertEqual(
+            chunk_prepared.generation_config.audio_chunk_threshold,
+            DEFAULT_AUDIO_CHUNK_THRESHOLD,
+        )
+        self.assertEqual(result.worker_id, 1)
+
+    def test_parallel_chunking_requires_beneficial_size(self) -> None:
+        payload = SpeechRequest(
+            input="One sentence. Two sentence. Three sentence. Four sentence.",
+            voice="alloy",
+            response_format="wav",
+            sentence_chunking_min_chars=64,
+        )
+        prepared = _prepare_request(payload)
+        prepared.chunk_plan = ["One sentence.", "Two sentence."]
+        prepared.force_sentence_chunking = True
+
+        with (
+            patch("omnivoice.openai_tts_server.WORKER_MODE", False),
+            patch("omnivoice.openai_tts_server.CHUNKED_PIPELINE_ENABLED", True),
+            patch("omnivoice.openai_tts_server.CHUNK_MAX_WORKERS", 2),
+            patch("omnivoice.openai_tts_server.CHUNK_MIN_PARALLEL_CHUNKS", 2),
+            patch(
+                "omnivoice.openai_tts_server.CHUNK_MIN_PARALLEL_CHARS",
+                len(prepared.text) + 1,
+            ),
+        ):
+            self.assertFalse(_should_use_parallel_chunking(prepared, payload))
+
+        with (
+            patch("omnivoice.openai_tts_server.WORKER_MODE", False),
+            patch("omnivoice.openai_tts_server.CHUNKED_PIPELINE_ENABLED", True),
+            patch("omnivoice.openai_tts_server.CHUNK_MAX_WORKERS", 2),
+            patch("omnivoice.openai_tts_server.CHUNK_MIN_PARALLEL_CHUNKS", 2),
+            patch("omnivoice.openai_tts_server.CHUNK_MIN_PARALLEL_CHARS", 1),
+        ):
+            self.assertTrue(_should_use_parallel_chunking(prepared, payload))
 
 
 if __name__ == "__main__":
