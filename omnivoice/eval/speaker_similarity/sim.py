@@ -132,7 +132,7 @@ def worker_init(
             ssl_model_path=ssl_model_path,
         )
         state_dict = torch.load(
-            sv_model_path, map_location=lambda storage, loc: storage
+            sv_model_path, map_location="cpu", weights_only=True
         )
         worker_model.load_state_dict(state_dict["model"], strict=False)
         worker_model.to(worker_device)

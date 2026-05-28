@@ -179,3 +179,73 @@ class TestNoPyprojectGradio:
         # Check it's not listed as a dependency
         assert "gradio" not in content.lower(), "gradio found in pyproject.toml"
 
+
+class TestNoFrpcTunnelBinary:
+    """Verify the Gradio frpc reverse-proxy tunnel binary does not exist.
+
+    The frpc binary is automatically downloaded by Gradio to create public
+    tunnels (share=True). Its presence on a hardened system is a critical
+    security indicator — it means something is trying to expose the service
+    to the public internet.
+    """
+
+    FRPC_LOCATIONS = [
+        Path.home() / ".cache" / "huggingface" / "gradio" / "frpc",
+        Path.home() / ".cache" / "huggingface" / "gradio",
+        Path("/root/.cache/huggingface/gradio/frpc"),
+        Path("/root/.cache/huggingface/gradio"),
+    ]
+
+    def test_no_frpc_binary_exists(self):
+        """No frpc binary should exist anywhere in HuggingFace cache."""
+        for location in self.FRPC_LOCATIONS:
+            if not location.exists():
+                continue
+            if location.is_file() and "frpc" in location.name:
+                pytest.fail(
+                    f"SECURITY VIOLATION: frpc tunnel binary found at {location}. "
+                    f"Remove with: rm -rf {location.parent}"
+                )
+            if location.is_dir():
+                frpc_files = list(location.glob("**/frpc*"))
+                if frpc_files:
+                    pytest.fail(
+                        f"SECURITY VIOLATION: frpc tunnel binaries found in {location}: "
+                        f"{[str(f) for f in frpc_files[:5]]}. "
+                        f"Remove with: rm -rf {location}"
+                    )
+
+    def test_no_gradio_cache_directory(self):
+        """The entire gradio cache directory should not exist."""
+        gradio_cache = Path.home() / ".cache" / "huggingface" / "gradio"
+        if gradio_cache.exists():
+            contents = list(gradio_cache.iterdir())
+            if contents:
+                pytest.fail(
+                    f"SECURITY WARNING: Gradio cache directory exists with content: "
+                    f"{gradio_cache} ({len(contents)} items). "
+                    f"Remove with: rm -rf {gradio_cache}"
+                )
+
+    def test_startup_guard_blocks_frpc(self, tmp_path):
+        """Verify the __init__.py startup guard raises on frpc detection."""
+        # Simulate a frpc binary in a temp location and verify the guard logic
+        fake_frpc_dir = tmp_path / "gradio" / "frpc"
+        fake_frpc_dir.mkdir(parents=True)
+        fake_binary = fake_frpc_dir / "frpc_linux_amd64_v0.3"
+        fake_binary.write_bytes(b"\x00" * 100)
+
+        # Import the guard function and test it with patched paths
+        from unittest.mock import patch
+        from omnivoice import _FRPC_SEARCH_PATHS, _check_frpc_not_present
+
+        with patch("omnivoice._FRPC_SEARCH_PATHS", [fake_frpc_dir]):
+            with pytest.raises(RuntimeError, match="SECURITY VIOLATION"):
+                _check_frpc_not_present()
+
+    def test_import_omnivoice_exports_guard(self):
+        """Verify the frpc check function is accessible for testing."""
+        from omnivoice import _check_frpc_not_present
+        # Should not raise on a clean system
+        _check_frpc_not_present()
+

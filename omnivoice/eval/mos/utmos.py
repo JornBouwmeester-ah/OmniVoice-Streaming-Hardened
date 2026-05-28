@@ -122,7 +122,7 @@ def worker_init(
     worker_model = UTMOS22Strong()
     try:
         # Load weights to CPU first, then move to device
-        state_dict = torch.load(model_path, map_location="cpu")
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         worker_model.load_state_dict(state_dict)
     except Exception as e:
         logging.error(f"Failed to load model from {model_path}: {e}")
