@@ -2,6 +2,8 @@
 
 This document describes all security measures implemented in this hardened fork following a security incident caused by Gradio's silent `frpc` reverse-proxy tunnel deployment and uncontrolled HuggingFace Hub network access.
 
+**TL;DR** — Gradio was silently downloading and executing a reverse-proxy binary (`frpc`) that tunneled our internal service to the public internet. HuggingFace Hub calls leaked metadata and enabled model-swap attacks. Both vectors are now fully eliminated with 6 defense-in-depth layers and 153 automated regression tests.
+
 ---
 
 ## Summary of Changes
@@ -19,9 +21,10 @@ This document describes all security measures implemented in this hardened fork 
 
 ## Threat Model
 
-The original codebase had two criticals:
+The original codebase had two critical attack surfaces:
 
 1. **Gradio `frpc` binary** — Gradio silently downloads `frpc_linux_amd64_v0.3` to `~/.cache/huggingface/gradio/frpc/`. This binary establishes a reverse proxy tunnel exposing internal services to the public internet without explicit user consent.
+   - **Source**: [`gradio-app/gradio` → `gradio/tunneling.py`](https://github.com/gradio-app/gradio/blob/main/gradio/tunneling.py) — `BINARY_FOLDER = Path(HF_HOME) / "gradio" / "frpc"`, downloaded from `cdn-media.huggingface.co`, executed as a subprocess with `frpc http --server_addr {remote_host}:{remote_port}`.
 
 2. **HuggingFace Hub network calls** — `snapshot_download()` and `from_pretrained()` (without `local_files_only`) make outbound HTTPS requests, potentially leaking model identifiers, API tokens, or allowing model-swap attacks via compromised registries.
 
@@ -74,7 +77,7 @@ _FRPC_SEARCH_PATHS = [
 
 If any `frpc*` file is found, the application **raises `RuntimeError` and refuses to start**. This is a hard crash by design — security violations must never be silently tolerated.
 
-### Layer 5: No Download Code Path
+### Layer 5: No Download Code Path in Production
 
 The only script that downloads models (`scripts/download_models.sh`) is:
 
@@ -83,19 +86,8 @@ The only script that downloads models (`scripts/download_models.sh`) is:
 - Models are then transferred to the production VM via `rsync`
 - The production environment **never** runs this script
 
-### Layer 6: Optional Network Libraries
 
-`uvloop` and `httptools` are optional imports with graceful fallback — no forced network-related dependencies:
-
-```python
-try:
-    import uvloop
-    loop_impl = "uvloop"
-except ImportError:
-    loop_impl = "auto"
-```
-
-### Layer 7: Automated Regression Tests (153 tests)
+### Layer 6: Automated Regression Tests (153 tests)
 
 The test suite (`tests/test_security_hardening.py`) continuously validates:
 
@@ -170,8 +162,6 @@ The test suite (`tests/test_security_hardening.py`) continuously validates:
 ```bash
 pytest tests/test_security_hardening.py -v
 ```
-
-All 153 tests must pass before any deployment. These tests are designed to be run in CI and will catch regressions if any developer accidentally reintroduces a network dependency.
 
 ---
 
