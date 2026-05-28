@@ -33,7 +33,7 @@ This directory contains scripts and configs for training, fine-tuning, and evalu
    - `emilia_en_train.jsonl`, `emilia_en_dev.jsonl`
    - `emilia_zh_train.jsonl`, `emilia_zh_dev.jsonl`
 
-   You can generate them from the raw data, or download pre-processed manifests from [HuggingFace](https://huggingface.co/datasets/zhu-han/Emilia-Manifests).
+   You can generate them from the raw data or place pre-processed manifests from your internal storage.
 
 **Run the full pipeline:**
 
@@ -90,7 +90,7 @@ Main difference between fine-tuning config ([config/train_config_finetune.json](
 
 | Parameter | Emilia (from scratch) | Fine-tune | Why |
 |---|---|---|---|
-| `init_from_checkpoint` | `null` | `"k2-fsa/OmniVoice"` | Load pretrained weights |
+| `init_from_checkpoint` | `null` | `"/path/to/omnivoice-checkpoint"` | Load pretrained weights |
 | `steps` | 300,000 | 5,000 | Fewer steps for fine-tuning, can be tuned according to your data/task. |
 | `learning_rate` | 1e-4 | 5e-5 | Lower LR for fine-tuning, can be tuned according to your data/task |
 

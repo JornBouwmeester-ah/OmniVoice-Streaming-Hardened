@@ -22,8 +22,8 @@ DEV_JSONL="data/my_data_dev.jsonl"
 # Directory to write tokenized WebDataset shards
 TOKEN_DIR="data/finetune/tokens"
 
-# Audio tokenizer model (HuggingFace repo or local path)
-TOKENIZER_PATH="eustlb/higgs-audio-v2-tokenizer"
+# Audio tokenizer model (local path)
+TOKENIZER_PATH="/path/to/higgs-audio-v2-tokenizer"
 
 # Training config file
 TRAIN_CONFIG="config/train_config_finetune.json"

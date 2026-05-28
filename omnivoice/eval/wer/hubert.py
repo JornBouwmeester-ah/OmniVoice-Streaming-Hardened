@@ -33,6 +33,7 @@ from tqdm import tqdm
 
 from omnivoice.eval.utils import load_waveform
 from omnivoice.eval.wer.common import process_one
+from omnivoice.model_paths import EVAL_HUBERT_DIR
 from omnivoice.utils.data_utils import read_test_list
 
 # --- Global variables for worker processes ---
@@ -68,10 +69,9 @@ def get_parser():
         "--model-dir",
         type=str,
         required=True,
-        help="Local path of our evaluation model repository."
-        "Download from https://huggingface.co/k2-fsa/TTS_eval_models."
-        "Will use 'tts_eval_models/wer/hubert-large-ls960-ft/'"
-        " in this script",
+        help="Local path of evaluation models directory. "
+        "See omnivoice/model_paths.py for expected layout. "
+        "Will use 'wer/hubert-large-ls960-ft/' in this script.",
     )
     parser.add_argument(
         "--test-list",
@@ -118,11 +118,12 @@ def process_init(rank_queue, model_dir):
 
 
 def load_hubert_model(model_dir, device):
-    model_path = os.path.join(model_dir, "wer/hubert-large-ls960-ft/")
+    model_path = str(EVAL_HUBERT_DIR)
     if not os.path.exists(model_path):
         logging.error(
             f"Hubert model not found at {model_path}. "
-            "Please download from https://huggingface.co/k2-fsa/TTS_eval_models"
+            "Please place the model at the expected local path. "
+            "See omnivoice/model_paths.py for details."
         )
         return None
 
@@ -137,6 +138,7 @@ def load_hubert_model(model_dir, device):
         model=model_path,
         device=device,
         tokenizer=model_path,
+        local_files_only=True,
     )
     return pipe
 

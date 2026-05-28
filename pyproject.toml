@@ -35,7 +35,6 @@ dependencies = [
     "transformers>=5.3.0",
     "accelerate",
     "pydub",
-    "gradio",
     "tensorboardX",
     "webdataset",
     "numpy",
@@ -61,7 +60,6 @@ eval = [
 [project.scripts]
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
-omnivoice-demo = "omnivoice.cli.demo:main"
 omnivoice-openai-tts-server = "omnivoice.openai_tts_server:main"
 
 [project.urls]

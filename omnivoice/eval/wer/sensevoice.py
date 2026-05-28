@@ -35,6 +35,7 @@ from tqdm import tqdm
 
 from omnivoice.eval.wer.common import log_metrics, process_one
 from omnivoice.eval.wer.text_norm_omni import text_normalize
+from omnivoice.model_paths import EVAL_SENSEVOICE_DIR
 from omnivoice.utils.data_utils import read_test_list
 
 # --- Global variables for worker processes ---
@@ -99,9 +100,8 @@ def get_parser():
 
 
 def load_sensevoice_model(model_dir, device):
-    model_path = os.path.join(model_dir, "wer/SenseVoiceSmall")
+    model_path = str(EVAL_SENSEVOICE_DIR)
     if not os.path.exists(model_path):
-        # Fallback if specific sensevoice spelling isn't found
         logging.warning(
             f"SenseVoiceSmall not found at {model_path}. "
             f"Please ensure it is present in eval models."
@@ -116,7 +116,7 @@ def load_sensevoice_model(model_dir, device):
         from funasr import AutoModel
 
         model = AutoModel(
-            model="iic/SenseVoiceSmall",
+            model=model_path,
             device=str(device),
             disable_update=True,
             disable_pbar=True,

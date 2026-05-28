@@ -19,10 +19,10 @@ stop_stage=6
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
 # Specify the checkpoint to evaluate.
-CHECKPOINT=k2-fsa/OmniVoice
+CHECKPOINT=/path/to/omnivoice-checkpoint
 emilia_checkpoint=false
 
-# CHECKPOINT=k2-fsa/OmniVoice
+# CHECKPOINT=/path/to/omnivoice-emilia-checkpoint
 # emilia_checkpoint=true
 
 # For the OmniVoice-Emilia checkpoint, we set denoise to False and lang_id to None
@@ -65,47 +65,29 @@ get_test_list() {
 # ============================================================
 
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
-    echo "Stage 1: Download test sets and evaluation models"
+    echo "Stage 1: Validate local test sets and evaluation models"
+    echo "Expected local dirs: ${TTS_EVAL_DATA_DIR} and ${TTS_EVAL_MODEL_DIR}"
 
-    hf_repo=k2-fsa/TTS_eval_datasets
-    mkdir -p ${TTS_EVAL_DATA_DIR}/
-    for file in \
-        librispeech_pc_test_clean.jsonl \
-        librispeech_pc_test_clean_transcript.jsonl \
-        seedtts_test_en.jsonl \
-        seedtts_test_zh.jsonl \
-        minimax_multilingual_24.jsonl \
-        fleurs_multilingual_102.jsonl; do
-        echo "Downloading ${file}..."
-        huggingface-cli download \
-                --repo-type dataset \
-                --local-dir ${TTS_EVAL_DATA_DIR}/ \
-                ${hf_repo} \
-                ${file}
+    required_files=(
+        "${TTS_EVAL_DATA_DIR}/librispeech_pc_test_clean.jsonl"
+        "${TTS_EVAL_DATA_DIR}/librispeech_pc_test_clean_transcript.jsonl"
+        "${TTS_EVAL_DATA_DIR}/seedtts_test_en.jsonl"
+        "${TTS_EVAL_DATA_DIR}/seedtts_test_zh.jsonl"
+        "${TTS_EVAL_DATA_DIR}/minimax_multilingual_24.jsonl"
+        "${TTS_EVAL_DATA_DIR}/fleurs_multilingual_102.jsonl"
+    )
+
+    for file in "${required_files[@]}"; do
+        if [ ! -f "${file}" ]; then
+            echo "Missing required local file: ${file}" >&2
+            exit 1
+        fi
     done
 
-    for file in \
-        librispeech_pc_testset.tar.gz \
-        seedtts_testset.tar.gz \
-        minimax_multilingual_24.tar.gz \
-        fleurs_multilingual_102.tar.gz; do
-        echo "Downloading ${file}..."
-        huggingface-cli download \
-                --repo-type dataset \
-                --local-dir ${TTS_EVAL_DATA_DIR}/ \
-                ${hf_repo} \
-                ${file}
-
-        echo "Extracting ${file}..."
-        tar -xzf ${TTS_EVAL_DATA_DIR}/${file} -C ${TTS_EVAL_DATA_DIR}/
-    done
-
-    echo "Download all evaluation models"
-    hf_repo=k2-fsa/TTS_eval_models
-    mkdir -p ${TTS_EVAL_MODEL_DIR}
-    huggingface-cli download \
-        --local-dir ${TTS_EVAL_MODEL_DIR} \
-        ${hf_repo}
+    if [ ! -d "${TTS_EVAL_MODEL_DIR}" ]; then
+        echo "Missing required local model directory: ${TTS_EVAL_MODEL_DIR}" >&2
+        exit 1
+    fi
 fi
 
 # ============================================================

@@ -36,14 +36,17 @@ class ECAPA_TDNN_WAVLM(nn.Module):
         self.sr = sr
 
         if ssl_model_path is None:
-            self.feature_extract = torch.hub.load("s3prl/s3prl", "wavlm_large")
-        else:
-            self.feature_extract = torch.hub.load(
-                os.path.dirname(ssl_model_path),
-                "wavlm_local",
-                source="local",
-                ckpt=os.path.join(ssl_model_path, "wavlm_large.pt"),
+            raise ValueError(
+                "ssl_model_path is required. Provide the local path to the "
+                "WavLM model directory (containing wavlm_large.pt and hubconf.py). "
+                "Remote downloads are disabled."
             )
+        self.feature_extract = torch.hub.load(
+            os.path.dirname(ssl_model_path),
+            "wavlm_local",
+            source="local",
+            ckpt=os.path.join(ssl_model_path, "wavlm_large.pt"),
+        )
 
         if len(self.feature_extract.model.encoder.layers) == 24 and hasattr(
             self.feature_extract.model.encoder.layers[23].self_attn,

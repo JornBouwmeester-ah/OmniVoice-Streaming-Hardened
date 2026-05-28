@@ -35,13 +35,18 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydub import AudioSegment
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.model_paths import OMNIVOICE_MODEL_DIR, ASR_MODEL_DIR
 from omnivoice.utils.audio import cross_fade_chunks
-from omnivoice.utils.common import get_best_device, resolve_inference_dtype
+from omnivoice.utils.common import (
+    get_best_device,
+    require_local_path,
+    resolve_inference_dtype,
+)
 from omnivoice.utils.text import ABBREVIATIONS, CLOSING_MARKS, add_punctuation
 
 
 LOG = logging.getLogger("omnivoice.openai_tts_server")
-BACKEND_MODEL_ID = os.getenv("OMNIVOICE_MODEL_ID", "k2-fsa/OmniVoice")
+BACKEND_MODEL_ID = os.getenv("OMNIVOICE_MODEL_ID", str(OMNIVOICE_MODEL_DIR))
 API_MODEL_ID = os.getenv("OMNIVOICE_API_MODEL_ID", "omnivoice")
 DEFAULT_HOST = os.getenv("OMNIVOICE_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("OMNIVOICE_PORT", "6655"))
@@ -84,9 +89,7 @@ CHUNK_SECONDARY_STARTUP_TIMEOUT = max(
 CHUNK_MIN_FREE_GPU_MB = max(0, int(os.getenv("OMNIVOICE_CHUNK_MIN_FREE_GPU_MB", "6000")))
 CUDA_MEMORY_FRACTION = float(os.getenv("OMNIVOICE_CUDA_MEMORY_FRACTION", "0.50"))
 WORKER_MODE = os.getenv("OMNIVOICE_WORKER_MODE", "0") == "1"
-DEFAULT_ASR_MODEL_ID = os.getenv(
-    "OMNIVOICE_ASR_MODEL_ID", "openai/whisper-large-v3-turbo"
-)
+DEFAULT_ASR_MODEL_ID = os.getenv("OMNIVOICE_ASR_MODEL_ID", str(ASR_MODEL_DIR))
 MAX_SANITIZED_INPUT_CHARS = int(os.getenv("OMNIVOICE_MAX_INPUT_CHARS", "12000"))
 MAX_RAW_INPUT_CHARS = int(
     os.getenv("OMNIVOICE_MAX_RAW_INPUT_CHARS", str(MAX_SANITIZED_INPUT_CHARS * 2))
@@ -1341,12 +1344,18 @@ class ASRService:
     def _load_pipeline_sync(self):
         from transformers import pipeline as hf_pipeline
 
-        LOG.info("Loading ASR model %s on %s", self.model_id, self.device)
+        local_model_id = require_local_path(
+            self.model_id,
+            arg_name="OMNIVOICE_ASR_MODEL_ID",
+            expect_dir=True,
+        )
+        LOG.info("Loading ASR model %s on %s", local_model_id, self.device)
         pipe = hf_pipeline(
             "automatic-speech-recognition",
-            model=self.model_id,
+            model=local_model_id,
             dtype=resolve_inference_dtype(self.device),
             device_map=self.device,
+            local_files_only=True,
         )
         LOG.info("ASR model loaded on %s", self.device)
         return pipe
@@ -3514,7 +3523,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
-    parser.add_argument("--model-id", default=BACKEND_MODEL_ID)
+    parser.add_argument(
+        "--model-id",
+        default=BACKEND_MODEL_ID,
+        help="Local OmniVoice checkpoint directory.",
+    )
     parser.add_argument(
         "--idle-timeout",
         type=float,
@@ -3534,6 +3547,8 @@ def main() -> None:
     _configure_logging()
     args = build_parser().parse_args()
 
+    model_id = require_local_path(args.model_id, arg_name="--model-id", expect_dir=True)
+
     global WORKER_MODE
     WORKER_MODE = bool(args.worker_mode)
     if WORKER_MODE:
@@ -3541,7 +3556,7 @@ def main() -> None:
 
     global service
     service = OmniVoiceService(
-        args.model_id, args.device, idle_timeout=args.idle_timeout
+        model_id, args.device, idle_timeout=args.idle_timeout
     )
     global asr_service
     asr_service = ASRService(

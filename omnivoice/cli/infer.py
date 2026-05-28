@@ -5,17 +5,17 @@ voice design, or auto voice.
 
 Usage:
     # Voice cloning
-    omnivoice-infer --model k2-fsa/OmniVoice \
+    omnivoice-infer --model /path/to/omnivoice-checkpoint \
         --text "Hello, this is a text for text-to-speech." \
         --ref_audio ref.wav --ref_text "Reference transcript." --output out.wav
 
     # Voice design
-    omnivoice-infer --model k2-fsa/OmniVoice \
+    omnivoice-infer --model /path/to/omnivoice-checkpoint \
         --text "Hello, this is a text for text-to-speech." \
         --instruct "male, British accent" --output out.wav
 
     # Auto voice
-    omnivoice-infer --model k2-fsa/OmniVoice \
+    omnivoice-infer --model /path/to/omnivoice-checkpoint \
         --text "Hello, this is a text for text-to-speech." --output out.wav
 """
 
@@ -25,7 +25,7 @@ import logging
 import torchaudio
 
 from omnivoice.models.omnivoice import OmniVoice
-from omnivoice.utils.common import get_best_device, str2bool
+from omnivoice.utils.common import get_best_device, require_local_path, str2bool
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -36,8 +36,8 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         type=str,
-        default="k2-fsa/OmniVoice",
-        help="Model checkpoint path or HuggingFace repo id.",
+        required=True,
+        help="Local model checkpoint directory.",
     )
     parser.add_argument(
         "--text",
@@ -115,8 +115,9 @@ def main():
     args = get_parser().parse_args()
 
     device = args.device or get_best_device()
-    logging.info(f"Loading model from {args.model} on {device} ...")
-    model = OmniVoice.from_pretrained(args.model, device_map=device)
+    model_path = require_local_path(args.model, arg_name="--model", expect_dir=True)
+    logging.info(f"Loading model from {model_path} on {device} ...")
+    model = OmniVoice.from_pretrained(model_path, device_map=device)
 
     logging.info(f"Generating audio for: {args.text[:80]}...")
     audios = model.generate(

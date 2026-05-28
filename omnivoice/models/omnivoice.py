@@ -60,8 +60,10 @@ from omnivoice.utils.audio import (
     trim_long_audio,
     trim_trailing_artifact,
 )
+from omnivoice.model_paths import ASR_MODEL_DIR
 from omnivoice.utils.common import (
     configure_cuda_inference,
+    require_local_path,
     resolve_device_string,
     resolve_inference_dtype,
 )
@@ -261,7 +263,7 @@ class OmniVoice(PreTrainedModel):
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         train_mode = kwargs.pop("train", False)
         load_asr = kwargs.pop("load_asr", False)
-        asr_model_name = kwargs.pop("asr_model_name", "openai/whisper-large-v3-turbo")
+        asr_model_name = kwargs.pop("asr_model_name", str(ASR_MODEL_DIR))
         requested_dtype = kwargs.pop("dtype", None)
         requested_torch_dtype = kwargs.pop("torch_dtype", None)
         if requested_dtype is not None and requested_torch_dtype is not None:
@@ -275,6 +277,12 @@ class OmniVoice(PreTrainedModel):
         resolved_dtype = (
             requested_dtype if requested_dtype is not None else requested_torch_dtype
         )
+        pretrained_model_name_or_path = require_local_path(
+            str(pretrained_model_name_or_path),
+            arg_name="pretrained_model_name_or_path",
+            expect_dir=True,
+        )
+        kwargs["local_files_only"] = True
 
         if not train_mode:
             kwargs["dtype"] = resolve_inference_dtype(
@@ -290,7 +298,7 @@ class OmniVoice(PreTrainedModel):
         elif resolved_dtype is not None:
             kwargs["dtype"] = resolved_dtype
 
-        # Suppress noisy INFO logs from transformers/huggingface_hub during loading
+        # Suppress noisy INFO logs from transformers during loading
         _prev_disable = logging.root.manager.disable
         logging.disable(logging.INFO)
 
@@ -300,34 +308,33 @@ class OmniVoice(PreTrainedModel):
             )
 
             if not train_mode:
-                # Resolve local path for audio tokenizer subdirectory
-                if os.path.isdir(pretrained_model_name_or_path):
-                    resolved_path = pretrained_model_name_or_path
-                else:
-                    from huggingface_hub import snapshot_download
-
-                    resolved_path = snapshot_download(pretrained_model_name_or_path)
+                resolved_path = pretrained_model_name_or_path
 
                 model.text_tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path
+                    resolved_path,
+                    local_files_only=True,
                 )
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
                 if not os.path.isdir(audio_tokenizer_path):
-                    # Fallback to the HuggingFace Hub path of transformers'
-                    # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
-                    audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
+                    raise FileNotFoundError(
+                        "Missing local audio tokenizer directory: "
+                        f"{audio_tokenizer_path}"
+                    )
 
                 # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
                 model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
+                    audio_tokenizer_path,
+                    device_map=tokenizer_device,
+                    local_files_only=True,
                 )
                 model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
+                    audio_tokenizer_path,
+                    local_files_only=True,
                 )
 
                 model.sampling_rate = model.feature_extractor.sampling_rate
@@ -345,14 +352,19 @@ class OmniVoice(PreTrainedModel):
     # ASR support (optional, for auto-transcription)
     # -------------------------------------------------------------------
 
-    def load_asr_model(self, model_name: str = "openai/whisper-large-v3-turbo"):
+    def load_asr_model(self, model_name: str = str(ASR_MODEL_DIR)):
         """Load a Whisper ASR model for reference audio transcription.
 
         Args:
-            model_name: HuggingFace model name for the Whisper model.
+            model_name: Local filesystem path to a Whisper model directory.
         """
         from transformers import pipeline as hf_pipeline
 
+        model_name = require_local_path(
+            model_name,
+            arg_name="model_name",
+            expect_dir=True,
+        )
         logger.info("Loading ASR model %s ...", model_name)
         asr_dtype = resolve_inference_dtype(self.device)
         self._asr_pipe = hf_pipeline(
@@ -360,6 +372,7 @@ class OmniVoice(PreTrainedModel):
             model=model_name,
             dtype=asr_dtype,
             device_map=self.device,
+            local_files_only=True,
         )
         logger.info("ASR model loaded on %s.", self.device)
 

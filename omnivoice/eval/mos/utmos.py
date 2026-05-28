@@ -33,6 +33,7 @@ from tqdm import tqdm
 
 from omnivoice.eval.models.utmos import UTMOS22Strong
 from omnivoice.eval.utils import load_waveform
+from omnivoice.model_paths import EVAL_UTMOS_WEIGHTS
 from omnivoice.utils.data_utils import read_test_list
 
 warnings.filterwarnings("ignore")
@@ -64,10 +65,9 @@ def get_parser() -> argparse.ArgumentParser:
         "--model-dir",
         type=str,
         required=True,
-        help="Local path of our evaluation model repository."
-        "Download from https://huggingface.co/k2-fsa/TTS_eval_models."
-        "Will use 'tts_eval_models/mos/utmos22_strong_step7459_v1.pt'"
-        " in this script",
+        help="Local path of evaluation models directory. "
+        "See omnivoice/model_paths.py for expected layout. "
+        "Will use 'mos/utmos22_strong_step7459_v1.pt' in this script.",
     )
     parser.add_argument(
         "--extension",
@@ -173,7 +173,7 @@ def main():
         logging.error(f"Invalid directory: {args.wav_path}")
         sys.exit(1)
 
-    model_path = os.path.join(args.model_dir, "mos/utmos22_strong_step7459_v1.pt")
+    model_path = str(EVAL_UTMOS_WEIGHTS)
     if not os.path.exists(model_path):
         logging.error(f"Model file not found at {model_path}")
         sys.exit(1)

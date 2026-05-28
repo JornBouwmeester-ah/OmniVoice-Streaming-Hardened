@@ -10,7 +10,7 @@ import torch
 from omnivoice import OmniVoice
 
 model = OmniVoice.from_pretrained(
-    "k2-fsa/OmniVoice",
+    "/path/to/omnivoice-checkpoint",
     device_map="cuda:0",
     dtype=torch.float16
 )

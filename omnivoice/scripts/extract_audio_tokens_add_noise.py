@@ -73,7 +73,7 @@ from tqdm.auto import tqdm
 from transformers import AutoFeatureExtractor, HiggsAudioV2TokenizerModel
 
 from omnivoice.data.dataset import JsonlDatasetReader, WebDatasetReader
-from omnivoice.utils.common import str2bool
+from omnivoice.utils.common import require_local_path, str2bool
 
 warnings.filterwarnings(
     "ignore", category=FutureWarning, module="torch.nn.utils.weight_norm"
@@ -126,8 +126,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tokenizer_path",
         type=str,
-        default="eustlb/higgs-audio-v2-tokenizer",
-        help="Path to audio tokenizer.",
+        required=True,
+        help="Path to local audio tokenizer directory.",
     )
     parser.add_argument(
         "--skip_errors", action="store_true", help="Skip items that fail to process"
@@ -316,9 +316,14 @@ def process_init(rank_queue, tokenizer_path, noise_manifest=None, rir_manifest=N
 
     logging.debug(f"Worker process initialized with device: {worker_device}")
     # Load tokenizer onto the specified device
-    worker_feature_extractor = AutoFeatureExtractor.from_pretrained(tokenizer_path)
+    worker_feature_extractor = AutoFeatureExtractor.from_pretrained(
+        tokenizer_path,
+        local_files_only=True,
+    )
     worker_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-        tokenizer_path, device_map=worker_device
+        tokenizer_path,
+        device_map=worker_device,
+        local_files_only=True,
     )
     logging.debug(f"Tokenizer loaded successfully on device {worker_device}")
 
@@ -515,6 +520,11 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     mp.set_start_method("spawn", force=True)
+    args.tokenizer_path = require_local_path(
+        args.tokenizer_path,
+        arg_name="--tokenizer_path",
+        expect_dir=True,
+    )
 
     # Validate input arguments
     assert bool(args.input_manifest) != bool(

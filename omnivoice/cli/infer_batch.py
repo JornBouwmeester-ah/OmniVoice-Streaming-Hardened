@@ -21,7 +21,7 @@ Distributes TTS generation across multiple GPUs for large-scale tasks.
 Reads a JSONL test list, generates audio in parallel, and saves results.
 
 Usage:
-    omnivoice-infer-batch --model k2-fsa/OmniVoice \
+    omnivoice-infer-batch --model /path/to/omnivoice-checkpoint \
         --test_list test.jsonl --res_dir results/
 
 Test list format (JSONL, one JSON object per line):
@@ -49,7 +49,7 @@ from tqdm import tqdm
 
 from omnivoice.models.omnivoice import OmniVoice, VoiceClonePrompt
 from omnivoice.utils.audio import load_audio
-from omnivoice.utils.common import get_best_device_and_count, str2bool
+from omnivoice.utils.common import get_best_device_and_count, require_local_path, str2bool
 from omnivoice.utils.data_utils import read_test_list
 from omnivoice.utils.duration import RuleDurationEstimator
 
@@ -115,8 +115,8 @@ def get_parser():
     parser.add_argument(
         "--model",
         type=str,
-        default="k2-fsa/OmniVoice",
-        help="Path to the model checkpoint (local dir or HF repo id). "
+        required=True,
+        help="Path to the local model checkpoint directory. "
         "Audio tokenizer is expected at <checkpoint>/audio_tokenizer/.",
     )
     parser.add_argument(
@@ -483,6 +483,7 @@ def main():
     mp.set_start_method("spawn", force=True)
 
     args = get_parser().parse_args()
+    args.model = require_local_path(args.model, arg_name="--model", expect_dir=True)
     os.makedirs(args.res_dir, exist_ok=True)
 
     device_type, num_devices = get_best_device_and_count()

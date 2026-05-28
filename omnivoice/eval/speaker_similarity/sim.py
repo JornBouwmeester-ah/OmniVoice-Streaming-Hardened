@@ -34,6 +34,7 @@ from tqdm import tqdm
 
 from omnivoice.eval.models.ecapa_tdnn_wavlm import ECAPA_TDNN_WAVLM
 from omnivoice.eval.utils import load_waveform
+from omnivoice.model_paths import EVAL_ECAPA_TDNN_WEIGHTS, EVAL_WAVLM_DIR
 from omnivoice.utils.data_utils import read_test_list
 
 warnings.filterwarnings("ignore")
@@ -65,10 +66,10 @@ def get_parser() -> argparse.ArgumentParser:
         "--model-dir",
         type=str,
         required=True,
-        help="Local path of our evaluation model repository."
-        "Download from https://huggingface.co/k2-fsa/TTS_eval_models."
-        "Will use 'tts_eval_models/speaker_similarity/wavlm_large_finetune.pth'"
-        "and 'tts_eval_models/speaker_similarity/wavlm_large/' in this script",
+        help="Local path of evaluation models directory. "
+        "See omnivoice/model_paths.py for expected layout. "
+        "Will use 'speaker_similarity/wavlm_large_finetune.pth' "
+        "and 'speaker_similarity/wavlm_large/' in this script.",
     )
     parser.add_argument(
         "--extension",
@@ -192,11 +193,9 @@ def main():
     formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
     logging.basicConfig(format=formatter, level=logging.INFO, force=True)
 
-    # Prepare paths
-    sv_model_path = os.path.join(
-        args.model_dir, "speaker_similarity/wavlm_large_finetune.pth"
-    )
-    ssl_model_path = os.path.join(args.model_dir, "speaker_similarity/wavlm_large/")
+    # Prepare paths (from centralized model_paths registry)
+    sv_model_path = str(EVAL_ECAPA_TDNN_WEIGHTS)
+    ssl_model_path = str(EVAL_WAVLM_DIR)
 
     if not os.path.exists(sv_model_path) or not os.path.exists(ssl_model_path):
         logging.error("Model files not found. Please check --model-dir.")

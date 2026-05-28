@@ -26,8 +26,8 @@ MANIFEST_DIR="data/emilia/manifests"
 # Directory to write tokenized WebDataset shards
 TOKEN_DIR="data/emilia/tokens"
 
-# Audio tokenizer model (HuggingFace repo or local path)
-TOKENIZER_PATH="eustlb/higgs-audio-v2-tokenizer"
+# Audio tokenizer model (local path)
+TOKENIZER_PATH="/path/to/higgs-audio-v2-tokenizer"
 
 # Training config file
 TRAIN_CONFIG="config/train_config_emilia.json"
@@ -48,7 +48,6 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
 
     # You should manually download the Emilia dataset from
     # https://openxlab.org.cn/datasets/Amphion/Emilia
-    # or https://huggingface.co/datasets/amphion/Emilia-Dataset/tree/fc71e07
     # and place it in the download directory.
     # Your download directory should at least contain the following structure:
     #
@@ -63,9 +62,8 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
     fi
 
     # We require JSONL manifests for the training and dev splits. You can
-    # either generate them yourself using the raw data and the provided
-    # metadata, or download our processed JSONL manifests from HuggingFace.
-    # https://huggingface.co/datasets/zhu-han/Emilia-Manifests
+    # generate them yourself using the raw data and the provided metadata,
+    # or stage pre-processed manifests from your internal storage.
     #
     # Place them as data/emilia/manifests/{emilia_en_train,emilia_en_dev,emilia_zh_train,emilia_zh_dev}.jsonl
 

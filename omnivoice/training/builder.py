@@ -42,6 +42,7 @@ from omnivoice.data.dataset import WebDatasetReader, prepare_data_manifests_from
 from omnivoice.data.processor import OmniVoiceSampleProcessor
 from omnivoice.models.omnivoice import OmniVoice, OmniVoiceConfig
 from omnivoice.training.config import TrainingConfig
+from omnivoice.utils.common import require_local_path
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,15 @@ def build_model_and_tokenizer(
         if config.init_from_checkpoint
         else config.llm_name_or_path
     )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer_path = require_local_path(
+        tokenizer_path,
+        arg_name="tokenizer_path",
+        expect_dir=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        local_files_only=True,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -77,15 +86,28 @@ def build_model_and_tokenizer(
         tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
 
     if config.init_from_checkpoint:
-        logger.info(f"Loading weights from {config.init_from_checkpoint}")
-        model = OmniVoice.from_pretrained(
+        checkpoint_path = require_local_path(
             config.init_from_checkpoint,
+            arg_name="init_from_checkpoint",
+            expect_dir=True,
+        )
+        logger.info(f"Loading weights from {checkpoint_path}")
+        model = OmniVoice.from_pretrained(
+            checkpoint_path,
             attn_implementation="flex_attention",
             dtype=torch.float32,
             train=True,
         )
     else:
-        llm_config = AutoConfig.from_pretrained(config.llm_name_or_path)
+        llm_path = require_local_path(
+            config.llm_name_or_path,
+            arg_name="llm_name_or_path",
+            expect_dir=True,
+        )
+        llm_config = AutoConfig.from_pretrained(
+            llm_path,
+            local_files_only=True,
+        )
 
         ov_config = OmniVoiceConfig(
             audio_vocab_size=config.audio_vocab_size,
@@ -99,9 +121,10 @@ def build_model_and_tokenizer(
         hf_logging.set_verbosity_error()  # suppress expected lm_head.weight warnings
 
         llm = AutoModel.from_pretrained(
-            config.llm_name_or_path,
+            llm_path,
             attn_implementation="flex_attention",
             dtype=torch.float32,
+            local_files_only=True,
         )
 
         hf_logging.set_verbosity(original_level)

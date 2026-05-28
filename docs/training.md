@@ -15,7 +15,7 @@ Key fields in training config file:
 
 | Field | Description | Default |
 |---|---|---|
-| `llm_name_or_path` | local LLM path or huggingface id | Qwen/Qwen3-0.6B |
+| `llm_name_or_path` | local LLM path | /path/to/qwen3-0.6b |
 | `steps` | Total training steps | 300,000 |
 | `learning_rate` | Peak learning rate | 1e-4 |
 | `batch_tokens` | Tokens per batch on each GPU | 8192 |

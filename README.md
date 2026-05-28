@@ -5,10 +5,6 @@
 </p>
 
 <p align="center">
-  <a href="https://huggingface.co/k2-fsa/OmniVoice"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-FFD21E" alt="Hugging Face Model"></a>
-  &nbsp;
-  <a href="https://huggingface.co/spaces/k2-fsa/OmniVoice"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Space-blue" alt="Hugging Face Space"></a>
-  &nbsp;
   <a href="https://arxiv.org/abs/2604.00688"><img src="https://img.shields.io/badge/arXiv-Paper-B31B1B.svg"></a>
   &nbsp;
   <a href="https://zhu-han.github.io/omnivoice"><img src="https://img.shields.io/badge/GitHub.io-Demo_Page-blue?logo=GitHub&style=flat-square"></a>
@@ -20,10 +16,7 @@ OmniVoice Streaming is a maintained fork of the original [OmniVoice](https://git
 
 ## Fork Highlights
 
-- **Inference stability**: fixed the batched decoding mask regression that could produce gibberish outputs in CFG inference.
-- **Server defaults**: the OpenAI-compatible TTS server now keeps the upstream OmniVoice generation parameters intact unless you override them.
-- **Operational polish**: added clearer server docs, regression coverage, and transcription-based validation for English and Spanish audio.
-- **Upstream credit**: thanks to the original OmniVoice creators; this fork keeps that attribution front and center.
+- **Security**: Removed Gradio & HuggingFace Hub integrations for security purposes
 
 ## Key Features
 
@@ -97,17 +90,13 @@ uv sync
 
 ## Quick Start
 
-Try OmniVoice without coding:
+Try OmniVoice quickly from the command line:
 
-- Launch the local web UI: `omnivoice-demo --ip 0.0.0.0 --port 8001`
-
-- Launch the OpenAI-compatible TTS server: `omnivoice-openai-tts-server --host 0.0.0.0 --port 6655`
+- Launch the OpenAI-compatible TTS server: `omnivoice-openai-tts-server --host 0.0.0.0 --port 6655 --model-id /path/to/omnivoice-checkpoint`
 
 - Open the browser UI: `http://127.0.0.1:6655/ui`
 
-- Or try it directly on [HuggingFace Space](https://huggingface.co/spaces/k2-fsa/OmniVoice)
-
-> If you have trouble connecting to HuggingFace when downloading the pre-trained models, set `export HF_ENDPOINT="https://hf-mirror.com"` before running.
+> This hardened fork only supports loading checkpoints from the local filesystem.
 
 ### GPU pool mode for shared machines
 
@@ -136,7 +125,7 @@ from omnivoice import OmniVoice
 import torchaudio
 
 model = OmniVoice.from_pretrained(
-    "k2-fsa/OmniVoice",
+    "/path/to/omnivoice-checkpoint",
     device_map="cuda:0",
 )
 # Apple Silicon users: use device_map="mps" instead
@@ -232,18 +221,9 @@ Three CLI entry points are provided. The CLI tools support all features availabl
 
 | Command | Description | Source |
 |---|---|---|
-| `omnivoice-demo` | Interactive Gradio web demo | [omnivoice/cli/demo.py](omnivoice/cli/demo.py) |
 | `omnivoice-infer` | Single-item inference | [omnivoice/cli/infer.py](omnivoice/cli/infer.py) |
 | `omnivoice-infer-batch` | Batch inference across multiple GPUs | [omnivoice/cli/infer_batch.py](omnivoice/cli/infer_batch.py) |
 | `omnivoice-openai-tts-server` | OpenAI-compatible FastAPI TTS server with request sanitization and sentence-aware chunking | [omnivoice/openai_tts_server.py](omnivoice/openai_tts_server.py) |
-
-### Demo
-
-```bash
-omnivoice-demo --ip 0.0.0.0 --port 8001
-```
-
-Provides a web UI for voice cloning and voice design. See `omnivoice-demo --help` for all options.
 
 ### Single Inference
 
@@ -251,21 +231,21 @@ Provides a web UI for voice cloning and voice design. See `omnivoice-demo --help
 # Voice Cloning
 # ref_text can be omitted (Whisper will auto-transcribe ref_audio to get it).
 omnivoice-infer \
-    --model k2-fsa/OmniVoice \
+    --model /path/to/omnivoice-checkpoint \
     --text "This is a test for text to speech." \
     --ref_audio ref.wav \
     --ref_text "Transcription of the reference audio." \
     --output hello.wav
 
 # Voice Design
-omnivoice-infer --model k2-fsa/OmniVoice \
+omnivoice-infer --model /path/to/omnivoice-checkpoint \
     --text "This is a test for text to speech." \
     --instruct "male, British accent" \
     --output hello.wav
 
 # Auto Voice
 omnivoice-infer \
-    --model k2-fsa/OmniVoice \
+    --model /path/to/omnivoice-checkpoint \
     --text "This is a test for text to speech."\
     --output hello.wav
 ```
@@ -276,7 +256,7 @@ omnivoice-infer \
 
 ```bash
 omnivoice-infer-batch \
-    --model k2-fsa/OmniVoice \
+    --model /path/to/omnivoice-checkpoint \
     --test_list test.jsonl \
     --res_dir results/
 ```

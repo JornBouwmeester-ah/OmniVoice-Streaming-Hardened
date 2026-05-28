@@ -26,6 +26,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple
 
+from omnivoice.model_paths import LLM_BASE_DIR
+
 
 @dataclass
 class TrainingConfig:
@@ -34,7 +36,7 @@ class TrainingConfig:
     data_config: Optional[str] = None
 
     # Model Specific
-    llm_name_or_path: str = "Qwen/Qwen3-0.6B"
+    llm_name_or_path: str = str(LLM_BASE_DIR)
     audio_vocab_size: int = 1025  # valid vocab size + 1 (mask token)
     audio_mask_id: int = 1024  # 1024 is the 1025-th token
     num_audio_codebook: int = 8

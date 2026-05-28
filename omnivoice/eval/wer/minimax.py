@@ -36,6 +36,7 @@ from tqdm import tqdm
 
 from omnivoice.eval.utils import load_waveform
 from omnivoice.eval.wer.common import log_metrics, process_one
+from omnivoice.model_paths import EVAL_WHISPER_DIR, EVAL_PARAFORMER_DIR
 from omnivoice.eval.wer.text_norm_omni import text_normalize
 from omnivoice.utils.data_utils import read_test_list
 
@@ -94,8 +95,8 @@ def get_parser():
         "--model-dir",
         type=str,
         required=True,
-        help="Local path of evaluation models repository. "
-        "Download from https://huggingface.co/k2-fsa/TTS_eval_models. ",
+        help="Local path of evaluation models directory. "
+        "See omnivoice/model_paths.py for expected layout.",
     )
     parser.add_argument(
         "--test-list",
@@ -132,7 +133,7 @@ def get_parser():
 
 
 def load_whisper_model(model_dir, device):
-    model_path = os.path.join(model_dir, "wer/whisper-large-v3/")
+    model_path = str(EVAL_WHISPER_DIR)
     if not os.path.exists(model_path):
         logging.error(f"Whisper model not found at {model_path}.")
         return None
@@ -149,12 +150,13 @@ def load_whisper_model(model_dir, device):
         chunk_length_s=30,
         dtype=torch.float16 if "cuda" in str(device) else torch.float32,
         device=device,
+        local_files_only=True,
     )
     return pipe
 
 
 def load_paraformer_model(model_dir, device):
-    model_path = os.path.join(model_dir, "wer/paraformer-zh/")
+    model_path = str(EVAL_PARAFORMER_DIR)
     if not os.path.exists(model_path):
         logging.error(f"Paraformer model not found at {model_path}.")
         return None

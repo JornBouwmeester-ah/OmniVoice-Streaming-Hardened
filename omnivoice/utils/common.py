@@ -18,6 +18,7 @@
 """Shared utility functions."""
 
 import argparse
+from pathlib import Path
 import random
 from typing import Any
 
@@ -152,3 +153,33 @@ def configure_cuda_inference(device: Any) -> None:
     # every subsequent call with the same shape benefits.  Critical for the
     # audio tokenizer which has fixed-size convolutional layers.
     torch.backends.cudnn.benchmark = True
+
+
+def require_local_path(
+    path: str,
+    *,
+    arg_name: str,
+    must_exist: bool = True,
+    expect_dir: bool = False,
+) -> str:
+    """Validate that a CLI/config path points to a local filesystem path.
+
+    This intentionally rejects remote model identifiers such as
+    ``k2-fsa/OmniVoice`` so model loading cannot reach out to Hugging Face Hub.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"{arg_name} must be a non-empty local filesystem path")
+
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    resolved = candidate.resolve(strict=False)
+
+    if must_exist and not resolved.exists():
+        raise ValueError(
+            f"{arg_name} must point to an existing local path: {resolved}"
+        )
+    if expect_dir and resolved.exists() and not resolved.is_dir():
+        raise ValueError(f"{arg_name} must point to a directory: {resolved}")
+    return str(resolved)
+
