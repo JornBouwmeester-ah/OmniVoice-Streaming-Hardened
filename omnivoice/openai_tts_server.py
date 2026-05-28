@@ -3567,6 +3567,20 @@ def main() -> None:
     global secondary_worker_manager
     secondary_worker_manager = SecondaryWorkerManager(port=args.port + CHUNK_SECONDARY_PORT_OFFSET)
 
+    # Use uvloop + httptools for performance when available; fall back gracefully.
+    loop_impl = "auto"
+    http_impl = "auto"
+    try:
+        import uvloop  # noqa: F401
+        loop_impl = "uvloop"
+    except ImportError:
+        pass
+    try:
+        import httptools  # noqa: F401
+        http_impl = "httptools"
+    except ImportError:
+        pass
+
     uvicorn.run(
         app,
         host=args.host,
@@ -3574,8 +3588,8 @@ def main() -> None:
         log_level="info",
         access_log=False,
         workers=1,
-        loop="uvloop",
-        http="httptools",
+        loop=loop_impl,
+        http=http_impl,
     )
 
 
