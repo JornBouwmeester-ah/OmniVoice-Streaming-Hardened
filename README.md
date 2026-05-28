@@ -16,7 +16,20 @@ OmniVoice Streaming is a maintained fork of the original [OmniVoice](https://git
 
 ## Fork Highlights
 
-- **Security**: Removed Gradio & HuggingFace Hub integrations for security purposes
+> ⚠️ **Security-hardened fork** — see [`SECURITY.md`](SECURITY.md) for the full threat model and all defense layers.
+
+This fork was created after a security incident caused by Gradio's silent deployment of an `frpc` reverse-proxy tunnel binary and uncontrolled HuggingFace Hub network access. **All network-facing dependencies have been removed.**
+
+| Change | Details |
+|--------|---------|
+| 🚫 **Gradio removed** | All Gradio imports, UI code, and dependencies eliminated |
+| 🚫 **HuggingFace Hub removed** | No `snapshot_download`, `hf_hub_download`, or Hub imports at runtime |
+| 🔒 **Offline enforcement** | `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `HF_DATASETS_OFFLINE=1` set at import |
+| 📁 **Local-only models** | Centralized `model_paths.py` — all models loaded from local filesystem only |
+| 🛡️ **frpc tunnel guard** | Hard crash (`RuntimeError`) if Gradio's `frpc` binary is detected on disk |
+| ✅ **153 security tests** | Automated regression suite prevents reintroduction of network dependencies |
+| 🌐 **FastAPI server** | OpenAI-compatible TTS API replaces Gradio UI (`/v1/audio/speech`, `/health`) |
+| 📦 **One-time download script** | `scripts/download_models.sh` for air-gapped deployment (run on dev machine, rsync to VM) |
 
 ## Key Features
 
